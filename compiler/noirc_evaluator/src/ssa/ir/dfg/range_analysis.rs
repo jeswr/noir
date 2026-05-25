@@ -72,14 +72,6 @@ fn unsigned_to_signed(value: u128, bit_size: u32) -> Option<i128> {
     }
 }
 
-fn fixed_nonnegative_shift(range: SignedRange, bit_size: u32) -> Option<u32> {
-    if range.min == range.max && range.min >= 0 && range.max < i128::from(bit_size) {
-        u32::try_from(range.max).ok()
-    } else {
-        None
-    }
-}
-
 /// Computes conservative numeric value ranges for SSA values.
 pub(super) struct Analysis<'dfg> {
     dfg: &'dfg DataFlowGraph,
@@ -600,11 +592,12 @@ impl ValueRange {
     fn cast_to_signed(self, source_type: &Type, target_bit_size: u32) -> Option<SignedRange> {
         match self {
             Self::Signed(range) => {
-                if range.fits_in_bits(target_bit_size) {
-                    Some(range)
-                } else {
-                    SignedRange::for_bit_size(target_bit_size)
-                }
+                let Type::Numeric(NumericType::Signed { bit_size }) = source_type else {
+                    return None;
+                };
+                range
+                    .to_unsigned(*bit_size, *bit_size)
+                    .and_then(|range| SignedRange::from_unsigned(range, target_bit_size))
             }
             Self::Unsigned(range) => {
                 let Type::Numeric(NumericType::Unsigned { .. } | NumericType::NativeField) =
@@ -755,13 +748,6 @@ impl SignedRange {
         if min <= max { Some(Self::new(min, max)) } else { None }
     }
 
-    fn fits_in_bits(self, bit_size: u32) -> bool {
-        let Some(type_range) = Self::for_bit_size(bit_size) else {
-            return false;
-        };
-        type_range.min <= self.min && self.max <= type_range.max
-    }
-
     fn max_bits(self, type_bit_size: u32) -> u32 {
         if self.min < 0 { type_bit_size } else { u128::BITS - (self.max as u128).leading_zeros() }
     }
@@ -770,61 +756,12 @@ impl SignedRange {
         Self::new(!self.max, !self.min)
     }
 
-    fn add(self, rhs: Self, type_range: Self) -> Self {
-        self.checked_result(rhs, type_range, i128::checked_add)
-    }
-
-    fn sub(self, rhs: Self, type_range: Self) -> Self {
-        let candidates = [self.min.checked_sub(rhs.max), self.max.checked_sub(rhs.min)];
-        Self::from_checked_candidates(candidates, type_range)
-    }
-
-    fn mul(self, rhs: Self, type_range: Self) -> Self {
-        self.checked_result(rhs, type_range, i128::checked_mul)
-    }
-
-    fn div(self, rhs: Self, type_range: Self) -> Self {
-        if rhs.contains(0) || (self.contains(type_range.min) && rhs.contains(-1)) {
-            return type_range;
-        }
-
-        self.checked_result(rhs, type_range, i128::checked_div)
-    }
-
-    fn modulo(self, rhs: Self, type_range: Self) -> Self {
-        if rhs.contains(0) || (self.contains(type_range.min) && rhs.contains(-1)) {
-            return type_range;
-        }
-
-        let max_abs_rhs = rhs.max_abs().saturating_sub(1);
-        let max_magnitude = max_abs_rhs.min(i128::MAX as u128) as i128;
-
-        if self.max < 0 {
-            let lhs_magnitude = self.max_abs().min(i128::MAX as u128) as i128;
-            Self::new(-max_magnitude.min(lhs_magnitude), 0)
-        } else if self.min >= 0 {
-            Self::new(0, max_magnitude.min(self.max))
+    fn fixed_shift(self, bit_size: u32) -> Option<u32> {
+        if self.min == self.max && self.min >= 0 && self.max < i128::from(bit_size) {
+            u32::try_from(self.max).ok()
         } else {
-            Self::new(-max_magnitude, max_magnitude)
+            None
         }
-    }
-
-    fn shl(self, rhs: Self, bit_size: u32, type_range: Self) -> Self {
-        let Some(shift) = fixed_nonnegative_shift(rhs, bit_size) else {
-            return type_range;
-        };
-
-        self.checked_result(Self::new(shift.into(), shift.into()), type_range, |lhs, rhs| {
-            lhs.checked_shl(u32::try_from(rhs).ok()?)
-        })
-    }
-
-    fn shr(self, rhs: Self, bit_size: u32, type_range: Self) -> Self {
-        let Some(shift) = fixed_nonnegative_shift(rhs, bit_size) else {
-            return type_range;
-        };
-
-        Self::new(self.min >> shift, self.max >> shift)
     }
 
     fn checked_result(
@@ -1073,23 +1010,45 @@ impl SignedBinaryRanges {
     }
 
     fn add(self) -> SignedRange {
-        self.lhs.add(self.rhs, self.type_range)
+        self.lhs.checked_result(self.rhs, self.type_range, i128::checked_add)
     }
 
     fn sub(self) -> SignedRange {
-        self.lhs.sub(self.rhs, self.type_range)
+        let candidates =
+            [self.lhs.min.checked_sub(self.rhs.max), self.lhs.max.checked_sub(self.rhs.min)];
+        SignedRange::from_checked_candidates(candidates, self.type_range)
     }
 
     fn mul(self) -> SignedRange {
-        self.lhs.mul(self.rhs, self.type_range)
+        self.lhs.checked_result(self.rhs, self.type_range, i128::checked_mul)
     }
 
     fn div(self) -> SignedRange {
-        self.lhs.div(self.rhs, self.type_range)
+        if self.rhs.contains(0) || (self.lhs.contains(self.type_range.min) && self.rhs.contains(-1))
+        {
+            return self.type_range;
+        }
+
+        self.lhs.checked_result(self.rhs, self.type_range, i128::checked_div)
     }
 
     fn modulo(self) -> SignedRange {
-        self.lhs.modulo(self.rhs, self.type_range)
+        if self.rhs.contains(0) || (self.lhs.contains(self.type_range.min) && self.rhs.contains(-1))
+        {
+            return self.type_range;
+        }
+
+        let max_abs_rhs = self.rhs.max_abs().saturating_sub(1);
+        let max_magnitude = max_abs_rhs.min(i128::MAX as u128) as i128;
+
+        if self.lhs.max < 0 {
+            let lhs_magnitude = self.lhs.max_abs().min(i128::MAX as u128) as i128;
+            SignedRange::new(-max_magnitude.min(lhs_magnitude), 0)
+        } else if self.lhs.min >= 0 {
+            SignedRange::new(0, max_magnitude.min(self.lhs.max))
+        } else {
+            SignedRange::new(-max_magnitude, max_magnitude)
+        }
     }
 
     fn bitwise(self) -> SignedRange {
@@ -1097,11 +1056,23 @@ impl SignedBinaryRanges {
     }
 
     fn shl(self) -> SignedRange {
-        self.lhs.shl(self.rhs, self.bit_size, self.type_range)
+        let Some(shift) = self.rhs.fixed_shift(self.bit_size) else {
+            return self.type_range;
+        };
+
+        self.lhs.checked_result(
+            SignedRange::new(shift.into(), shift.into()),
+            self.type_range,
+            |lhs, rhs| lhs.checked_shl(u32::try_from(rhs).ok()?),
+        )
     }
 
     fn shr(self) -> SignedRange {
-        self.lhs.shr(self.rhs, self.bit_size, self.type_range)
+        let Some(shift) = self.rhs.fixed_shift(self.bit_size) else {
+            return self.type_range;
+        };
+
+        SignedRange::new(self.lhs.min >> shift, self.lhs.max >> shift)
     }
 }
 
@@ -1141,7 +1112,7 @@ struct UnsignedBinaryBack<'a> {
 }
 
 impl<'a> UnsignedBinaryBack<'a> {
-    fn add(&self, unchecked: bool) -> Option<OperandRanges> {
+    fn add(&self, unchecked: bool) -> Option<OperandRanges<Range>> {
         if unchecked && self.result_may_wrap(u128::checked_add) {
             return None;
         }
@@ -1158,7 +1129,7 @@ impl<'a> UnsignedBinaryBack<'a> {
         )
     }
 
-    fn sub(&self, unchecked: bool) -> Option<OperandRanges> {
+    fn sub(&self, unchecked: bool) -> Option<OperandRanges<Range>> {
         if unchecked && self.ranges.lhs.min < self.ranges.rhs.max {
             return None;
         }
@@ -1177,7 +1148,7 @@ impl<'a> UnsignedBinaryBack<'a> {
         )
     }
 
-    fn mul(&self, unchecked: bool) -> Option<OperandRanges> {
+    fn mul(&self, unchecked: bool) -> Option<OperandRanges<Range>> {
         if unchecked && self.result_may_wrap(u128::checked_mul) {
             return None;
         }
@@ -1198,7 +1169,7 @@ impl<'a> UnsignedBinaryBack<'a> {
         Some(operands)
     }
 
-    fn div(&self) -> Option<OperandRanges> {
+    fn div(&self) -> Option<OperandRanges<Range>> {
         let mut operands = self.operands();
 
         if self.ranges.rhs.max > 0 {
@@ -1226,7 +1197,7 @@ impl<'a> UnsignedBinaryBack<'a> {
         Some(operands)
     }
 
-    fn bitor(&self) -> Option<OperandRanges> {
+    fn bitor(&self) -> Option<OperandRanges<Range>> {
         Some(
             self.operands()
                 .tighten_lhs(Range::new(0, self.result.max))
@@ -1234,7 +1205,7 @@ impl<'a> UnsignedBinaryBack<'a> {
         )
     }
 
-    fn shl(&self) -> Option<OperandRanges> {
+    fn shl(&self) -> Option<OperandRanges<Range>> {
         if self.ranges.rhs.min != self.ranges.rhs.max || self.ranges.rhs.max >= 128 {
             return None;
         }
@@ -1247,7 +1218,7 @@ impl<'a> UnsignedBinaryBack<'a> {
         Some(self.operands().tighten_lhs(Range::new(0, self.result.max >> shift)))
     }
 
-    fn apply(self, operands: Option<OperandRanges>) -> bool {
+    fn apply(self, operands: Option<OperandRanges<Range>>) -> bool {
         let Some(operands) = operands else {
             return false;
         };
@@ -1256,7 +1227,7 @@ impl<'a> UnsignedBinaryBack<'a> {
             | self.facts.refine(self.dfg, self.rhs, ValueRange::Unsigned(operands.rhs))
     }
 
-    fn operands(&self) -> OperandRanges {
+    fn operands(&self) -> OperandRanges<Range> {
         OperandRanges { lhs: self.ranges.lhs, rhs: self.ranges.rhs }
     }
 
@@ -1266,12 +1237,44 @@ impl<'a> UnsignedBinaryBack<'a> {
     }
 }
 
-struct OperandRanges {
-    lhs: Range,
-    rhs: Range,
+trait IntersectRange: Copy {
+    fn intersect(self, other: Self) -> Option<Self>;
 }
 
-impl OperandRanges {
+impl IntersectRange for Range {
+    fn intersect(self, other: Self) -> Option<Self> {
+        Range::intersect(self, other)
+    }
+}
+
+impl IntersectRange for SignedRange {
+    fn intersect(self, other: Self) -> Option<Self> {
+        SignedRange::intersect(self, other)
+    }
+}
+
+struct OperandRanges<T> {
+    lhs: T,
+    rhs: T,
+}
+
+impl<T: IntersectRange> OperandRanges<T> {
+    fn tighten_lhs(mut self, range: T) -> Self {
+        if let Some(range) = self.lhs.intersect(range) {
+            self.lhs = range;
+        }
+        self
+    }
+
+    fn tighten_rhs(mut self, range: T) -> Self {
+        if let Some(range) = self.rhs.intersect(range) {
+            self.rhs = range;
+        }
+        self
+    }
+}
+
+impl OperandRanges<Range> {
     // Empty intersections are ignored to match `Facts::refine`.
     fn tighten_lhs_bounds(self, min: u128, max: u128) -> Self {
         if min <= max { self.tighten_lhs(Range::new(min, max)) } else { self }
@@ -1279,20 +1282,6 @@ impl OperandRanges {
 
     fn tighten_rhs_bounds(self, min: u128, max: u128) -> Self {
         if min <= max { self.tighten_rhs(Range::new(min, max)) } else { self }
-    }
-
-    fn tighten_lhs(mut self, range: Range) -> Self {
-        if let Some(range) = self.lhs.intersect(range) {
-            self.lhs = range;
-        }
-        self
-    }
-
-    fn tighten_rhs(mut self, range: Range) -> Self {
-        if let Some(range) = self.rhs.intersect(range) {
-            self.rhs = range;
-        }
-        self
     }
 }
 
@@ -1306,7 +1295,7 @@ struct SignedBinaryBack<'a> {
 }
 
 impl<'a> SignedBinaryBack<'a> {
-    fn add(&self) -> Option<SignedOperandRanges> {
+    fn add(&self) -> Option<OperandRanges<SignedRange>> {
         let lhs = self.bounds(
             self.result.min.checked_sub(self.ranges.rhs.max),
             self.result.max.checked_sub(self.ranges.rhs.min),
@@ -1318,7 +1307,7 @@ impl<'a> SignedBinaryBack<'a> {
         Some(self.operands().tighten_lhs(lhs).tighten_rhs(rhs))
     }
 
-    fn sub(&self) -> Option<SignedOperandRanges> {
+    fn sub(&self) -> Option<OperandRanges<SignedRange>> {
         let lhs = self.bounds(
             self.result.min.checked_add(self.ranges.rhs.min),
             self.result.max.checked_add(self.ranges.rhs.max),
@@ -1330,7 +1319,7 @@ impl<'a> SignedBinaryBack<'a> {
         Some(self.operands().tighten_lhs(lhs).tighten_rhs(rhs))
     }
 
-    fn apply(self, operands: Option<SignedOperandRanges>) -> bool {
+    fn apply(self, operands: Option<OperandRanges<SignedRange>>) -> bool {
         let Some(operands) = operands else {
             return false;
         };
@@ -1339,35 +1328,14 @@ impl<'a> SignedBinaryBack<'a> {
             | self.facts.refine(self.dfg, self.rhs, ValueRange::Signed(operands.rhs))
     }
 
-    fn operands(&self) -> SignedOperandRanges {
-        SignedOperandRanges { lhs: self.ranges.lhs, rhs: self.ranges.rhs }
+    fn operands(&self) -> OperandRanges<SignedRange> {
+        OperandRanges { lhs: self.ranges.lhs, rhs: self.ranges.rhs }
     }
 
     fn bounds(&self, min: Option<i128>, max: Option<i128>) -> Option<SignedRange> {
         let min = min?.max(self.ranges.type_range.min);
         let max = max?.min(self.ranges.type_range.max);
         (min <= max).then(|| SignedRange::new(min, max))
-    }
-}
-
-struct SignedOperandRanges {
-    lhs: SignedRange,
-    rhs: SignedRange,
-}
-
-impl SignedOperandRanges {
-    fn tighten_lhs(mut self, range: SignedRange) -> Self {
-        if let Some(range) = self.lhs.intersect(range) {
-            self.lhs = range;
-        }
-        self
-    }
-
-    fn tighten_rhs(mut self, range: SignedRange) -> Self {
-        if let Some(range) = self.rhs.intersect(range) {
-            self.rhs = range;
-        }
-        self
     }
 }
 
@@ -1528,6 +1496,10 @@ mod tests {
         assert_eq!(
             SignedRange::from_unsigned(Range::new(240, 255), 8),
             Some(SignedRange::new(-16, -1))
+        );
+        assert_eq!(
+            ValueRange::Signed(negative).cast_to_signed(&Type::signed(8), 16),
+            Some(SignedRange::new(240, 255))
         );
     }
 
