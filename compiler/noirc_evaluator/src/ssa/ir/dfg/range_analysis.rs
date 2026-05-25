@@ -184,13 +184,6 @@ impl<'dfg> Analysis<'dfg> {
 
         match instruction {
             Instruction::Cast(original_value, _) => {
-                if !matches!(
-                    self.dfg.type_of_value(result).as_ref(),
-                    Type::Numeric(NumericType::Unsigned { .. } | NumericType::NativeField)
-                ) {
-                    return None;
-                }
-
                 let original_range = facts.range(*original_value)?;
                 match self.dfg.type_of_value(result).as_ref() {
                     Type::Numeric(NumericType::NativeField) => Some(original_range),
