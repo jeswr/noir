@@ -2,7 +2,7 @@ use acvm::AcirField;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::ssa::ir::{
-    instruction::{Binary, BinaryOp, Instruction, InstructionId},
+    instruction::{Binary, BinaryOp, Instruction},
     types::{NumericType, Type, max_unsigned_value_for_bit_size},
     value::{Value, ValueId},
 };
@@ -98,12 +98,6 @@ impl<'dfg> Analysis<'dfg> {
     }
 
     fn constrained_range(&self, value: ValueId) -> Option<Range> {
-        let mut facts = self.initial_facts();
-        self.apply_unconditional_constraints(&mut facts);
-        facts.range(value)
-    }
-
-    fn initial_facts(&self) -> Facts {
         let mut facts = Facts::default();
 
         for (value, _) in self.dfg.values_iter() {
@@ -112,88 +106,67 @@ impl<'dfg> Analysis<'dfg> {
             }
         }
 
-        facts
-    }
-
-    fn apply_unconditional_constraints(&self, facts: &mut Facts) {
         // Branch-local or predicated constraints cannot be used as global value bounds.
-        if self.dfg.blocks.len() != 1
-            || self.dfg.instructions.iter().any(|(_, instruction)| {
+        if self.dfg.blocks.len() == 1
+            && !self.dfg.instructions.iter().any(|(_, instruction)| {
                 matches!(instruction, Instruction::EnableSideEffectsIf { .. })
             })
         {
-            return;
-        }
-
-        self.seed_range_checks(facts);
-        self.propagate(facts);
-    }
-
-    fn seed_range_checks(&self, facts: &mut Facts) {
-        for (_, instruction) in self.dfg.instructions.iter() {
-            if let Instruction::RangeCheck { value, max_bit_size, .. } = instruction
-                && let Some(max) = max_unsigned_value_for_bit_size(*max_bit_size)
-            {
-                facts.refine(self.dfg, *value, Range::new(0, max));
-            }
-        }
-    }
-
-    fn propagate(&self, facts: &mut Facts) {
-        // Safety bound; this normally exits early once no facts change.
-        for _ in 0..=self.dfg.instructions.len() {
-            let mut changed = false;
-
-            for (instruction, instruction_data) in self.dfg.instructions.iter() {
-                changed |= self.propagate_instruction(instruction, instruction_data, facts);
+            for (_, instruction) in self.dfg.instructions.iter() {
+                if let Instruction::RangeCheck { value, max_bit_size, .. } = instruction
+                    && let Some(max) = max_unsigned_value_for_bit_size(*max_bit_size)
+                {
+                    facts.refine(self.dfg, *value, Range::new(0, max));
+                }
             }
 
-            if !changed {
-                break;
+            // Propagate range information in both directions until the facts stop changing.
+            // Safety bound; this normally exits early once no facts change.
+            for _ in 0..=self.dfg.instructions.len() {
+                let mut changed = false;
+
+                for (instruction, instruction_data) in self.dfg.instructions.iter() {
+                    let result = self
+                        .dfg
+                        .results
+                        .get(&instruction)
+                        .and_then(|results| results.first())
+                        .copied();
+
+                    if let Some(result) = result
+                        && let Some(range) = self.instruction_range(
+                            instruction_data,
+                            result,
+                            RangeSource::Facts(&facts),
+                        )
+                    {
+                        changed |= facts.refine(self.dfg, result, range);
+                    }
+
+                    changed |= self.backward(instruction_data, result, &mut facts);
+                    if let Instruction::Constrain(lhs, rhs, _) = instruction_data {
+                        changed |= match (facts.range(*lhs), facts.range(*rhs)) {
+                            (Some(lhs_range), Some(rhs_range)) => {
+                                lhs_range.intersect(rhs_range).is_some_and(|range| {
+                                    // Keep bitwise OR so both sides are refined.
+                                    facts.refine(self.dfg, *lhs, range)
+                                        | facts.refine(self.dfg, *rhs, range)
+                                })
+                            }
+                            (Some(range), None) => facts.refine(self.dfg, *rhs, range),
+                            (None, Some(range)) => facts.refine(self.dfg, *lhs, range),
+                            (None, None) => false,
+                        };
+                    }
+                }
+
+                if !changed {
+                    break;
+                }
             }
         }
-    }
 
-    fn propagate_instruction(
-        &self,
-        instruction: InstructionId,
-        instruction_data: &Instruction,
-        facts: &mut Facts,
-    ) -> bool {
-        let result =
-            self.dfg.results.get(&instruction).and_then(|results| results.first()).copied();
-        let mut changed = false;
-
-        if let Some(result) = result
-            && let Some(range) =
-                self.instruction_range(instruction_data, result, RangeSource::Facts(facts))
-        {
-            changed |= facts.refine(self.dfg, result, range);
-        }
-
-        changed |= self.backward(instruction_data, result, facts);
-        changed |= self.propagate_equality(instruction_data, facts);
-        changed
-    }
-
-    fn propagate_equality(&self, instruction: &Instruction, facts: &mut Facts) -> bool {
-        let Instruction::Constrain(lhs, rhs, _) = instruction else {
-            return false;
-        };
-
-        match (facts.range(*lhs), facts.range(*rhs)) {
-            (Some(lhs_range), Some(rhs_range)) => {
-                let Some(range) = lhs_range.intersect(rhs_range) else {
-                    return false;
-                };
-
-                // Keep bitwise OR so both sides are refined.
-                facts.refine(self.dfg, *lhs, range) | facts.refine(self.dfg, *rhs, range)
-            }
-            (Some(range), None) => facts.refine(self.dfg, *rhs, range),
-            (None, Some(range)) => facts.refine(self.dfg, *lhs, range),
-            (None, None) => false,
-        }
+        facts.range(value)
     }
 
     /// Compute an instruction result range from either recursive analysis or known facts.
