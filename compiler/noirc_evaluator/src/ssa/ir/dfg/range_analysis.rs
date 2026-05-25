@@ -825,3 +825,187 @@ impl BinaryOp {
         back.apply(operands)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binary_values(
+        bit_size: u32,
+        lhs_range: Range,
+        rhs_range: Range,
+        operator: BinaryOp,
+    ) -> (DataFlowGraph, Facts, Binary) {
+        let mut dfg = DataFlowGraph::default();
+        let block = dfg.make_block();
+        let lhs = dfg.add_block_parameter(block, Type::unsigned(bit_size));
+        let rhs = dfg.add_block_parameter(block, Type::unsigned(bit_size));
+
+        let mut facts = Facts::default();
+        facts.set(lhs, lhs_range);
+        facts.set(rhs, rhs_range);
+
+        (dfg, facts, Binary { lhs, rhs, operator })
+    }
+
+    fn apply_back(
+        bit_size: u32,
+        lhs_range: Range,
+        rhs_range: Range,
+        result: Range,
+        operator: BinaryOp,
+        operands: impl FnOnce(&BinaryBack<'_>) -> Option<OperandRanges>,
+    ) -> (bool, Range, Range) {
+        let ranges = BinaryRanges::new(bit_size, lhs_range, rhs_range).unwrap();
+        let (dfg, mut facts, binary) = binary_values(bit_size, lhs_range, rhs_range, operator);
+
+        let changed = {
+            let mut back =
+                BinaryBack { dfg: &dfg, facts: &mut facts, binary: &binary, result, ranges };
+            let operands = operands(&back);
+            back.apply(operands)
+        };
+
+        (changed, facts.range(binary.lhs).unwrap(), facts.range(binary.rhs).unwrap())
+    }
+
+    #[test]
+    fn range_not_inverts_bounds_within_type_max() {
+        assert_eq!(Range::new(3, 7).not(15), Range::new(8, 12));
+    }
+
+    #[test]
+    fn range_truncate_wraps_to_full_target_width() {
+        assert_eq!(Range::new(0, 10).truncate_to(15), Range::new(0, 10));
+        assert_eq!(Range::new(3, 20).truncate_to(15), Range::new(0, 15));
+    }
+
+    #[test]
+    fn range_intersect_returns_overlap_or_none() {
+        assert_eq!(Range::new(2, 8).intersect(Range::new(5, 10)), Some(Range::new(5, 8)));
+        assert_eq!(Range::new(2, 8).intersect(Range::new(9, 10)), None);
+    }
+
+    #[test]
+    fn range_increasing_result_uses_full_range_on_overflow() {
+        let range =
+            Range::new(200, 254).increasing_result(Range::new(2, 2), 255, u128::checked_add);
+        assert_eq!(range, Range::new(0, 255));
+    }
+
+    #[test]
+    fn binary_ranges_add_falls_back_when_sum_may_wrap() {
+        let ranges = BinaryRanges::new(8, Range::new(250, 255), Range::new(1, 10)).unwrap();
+
+        assert_eq!(ranges.add(), Range::new(0, 255));
+    }
+
+    #[test]
+    fn binary_ranges_mul_falls_back_when_product_may_wrap() {
+        let ranges = BinaryRanges::new(8, Range::new(100, 200), Range::new(2, 3)).unwrap();
+
+        assert_eq!(ranges.mul(), Range::new(0, 255));
+    }
+
+    #[test]
+    fn binary_ranges_sub_distinguishes_checked_and_unchecked_wrap() {
+        let ranges = BinaryRanges::new(8, Range::new(5, 10), Range::new(7, 8)).unwrap();
+
+        assert_eq!(ranges.sub(false), Range::new(0, 3));
+        assert_eq!(ranges.sub(true), Range::new(0, 255));
+    }
+
+    #[test]
+    fn binary_ranges_div_uses_lhs_max_when_rhs_can_be_zero() {
+        let ranges = BinaryRanges::new(8, Range::new(10, 20), Range::new(0, 5)).unwrap();
+
+        assert_eq!(ranges.div(), Range::new(0, 20));
+    }
+
+    #[test]
+    fn binary_ranges_modulo_uses_lhs_max_when_rhs_can_be_zero() {
+        let ranges = BinaryRanges::new(8, Range::new(10, 20), Range::new(0, 5)).unwrap();
+
+        assert_eq!(ranges.modulo(), Range::new(0, 20));
+    }
+
+    #[test]
+    fn binary_back_add_refines_both_operands() {
+        let (changed, lhs, rhs) = apply_back(
+            8,
+            Range::new(0, 255),
+            Range::new(0, 255),
+            Range::new(0, 15),
+            BinaryOp::Add { unchecked: false },
+            |back| back.add(false),
+        );
+
+        assert!(changed);
+        assert_eq!(lhs, Range::new(0, 15));
+        assert_eq!(rhs, Range::new(0, 15));
+    }
+
+    #[test]
+    fn binary_back_sub_refines_checked_operands() {
+        let (changed, lhs, rhs) = apply_back(
+            8,
+            Range::new(0, 255),
+            Range::new(0, 255),
+            Range::new(10, 20),
+            BinaryOp::Sub { unchecked: false },
+            |back| back.sub(false),
+        );
+
+        assert!(changed);
+        assert_eq!(lhs, Range::new(10, 255));
+        assert_eq!(rhs, Range::new(0, 245));
+    }
+
+    #[test]
+    fn binary_back_mul_refines_positive_operands() {
+        let (changed, lhs, rhs) = apply_back(
+            8,
+            Range::new(1, 255),
+            Range::new(1, 255),
+            Range::new(4, 20),
+            BinaryOp::Mul { unchecked: false },
+            |back| back.mul(false),
+        );
+
+        assert!(changed);
+        assert_eq!(lhs, Range::new(1, 20));
+        assert_eq!(rhs, Range::new(1, 20));
+    }
+
+    #[test]
+    fn binary_back_div_refines_lhs_from_nonzero_rhs() {
+        let (changed, lhs, rhs) = apply_back(
+            8,
+            Range::new(0, 255),
+            Range::new(2, 10),
+            Range::new(3, 4),
+            BinaryOp::Div,
+            |back| back.div(),
+        );
+
+        assert!(changed);
+        assert_eq!(lhs, Range::new(6, 49));
+        assert_eq!(rhs, Range::new(2, 10));
+    }
+
+    #[test]
+    fn binary_back_shl_refines_lhs_for_fixed_shift() {
+        let (changed, lhs, rhs) = apply_back(
+            8,
+            Range::new(0, 63),
+            Range::new(2, 2),
+            Range::new(0, 31),
+            BinaryOp::Shl,
+            |back| back.shl(),
+        );
+
+        assert!(changed);
+        assert_eq!(lhs, Range::new(0, 7));
+        assert_eq!(rhs, Range::new(2, 2));
+    }
+}
