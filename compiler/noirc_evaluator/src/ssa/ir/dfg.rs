@@ -40,7 +40,6 @@ use simplify::{SimplifyResult, simplify};
 
 mod range_analysis;
 pub(crate) mod simplify;
-pub(crate) use range_analysis::max_unsigned_value_for_bit_size;
 
 /// The DataFlowGraph contains most of the actual data in a function including
 /// its blocks, instructions, and values. This struct is largely responsible for

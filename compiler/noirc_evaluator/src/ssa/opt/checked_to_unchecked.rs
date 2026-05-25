@@ -6,10 +6,10 @@
 
 use crate::ssa::{
     ir::{
-        dfg::{DataFlowGraph, max_unsigned_value_for_bit_size},
+        dfg::DataFlowGraph,
         function::Function,
         instruction::{Binary, BinaryOp, Instruction},
-        types::NumericType,
+        types::{NumericType, max_unsigned_value_for_bit_size},
         value::ValueId,
     },
     ssa_gen::Ssa,
