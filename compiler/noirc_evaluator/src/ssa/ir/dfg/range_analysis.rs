@@ -61,17 +61,6 @@ impl<'dfg> Analysis<'dfg> {
                         value_bit_size.min(original_bit_size)
                     }
                     Instruction::Truncate { bit_size, .. } => value_bit_size.min(*bit_size),
-                    Instruction::Binary(binary) => {
-                        if !self.dfg.type_of_value(binary.lhs).unwrap_numeric().is_unsigned() {
-                            return value_bit_size;
-                        }
-
-                        binary.operator.max_bits(
-                            self.bits(binary.lhs),
-                            self.bits(binary.rhs),
-                            value_bit_size,
-                        )
-                    }
                     _ => value_bit_size,
                 }
             }
@@ -815,23 +804,6 @@ impl OperandRanges {
 }
 
 impl BinaryOp {
-    fn max_bits(self, lhs_bits: u32, rhs_bits: u32, value_bit_size: u32) -> u32 {
-        let max_bits = match self {
-            BinaryOp::Add { .. } => lhs_bits.max(rhs_bits).saturating_add(1),
-            BinaryOp::Sub { unchecked: false } => lhs_bits,
-            BinaryOp::Sub { unchecked: true } => value_bit_size,
-            BinaryOp::Mul { .. } => lhs_bits.saturating_add(rhs_bits),
-            BinaryOp::Div => lhs_bits,
-            BinaryOp::Mod => rhs_bits,
-            BinaryOp::Eq | BinaryOp::Lt => 1,
-            BinaryOp::And => lhs_bits.min(rhs_bits),
-            BinaryOp::Or | BinaryOp::Xor => lhs_bits.max(rhs_bits),
-            BinaryOp::Shl | BinaryOp::Shr => value_bit_size,
-        };
-
-        value_bit_size.min(max_bits)
-    }
-
     fn forward(self, ranges: Option<BinaryRanges>) -> Option<Range> {
         match self {
             BinaryOp::Eq | BinaryOp::Lt => Some(Range::bool()),
