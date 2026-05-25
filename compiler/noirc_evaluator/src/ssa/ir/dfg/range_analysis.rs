@@ -21,6 +21,36 @@ pub(super) struct Analysis<'dfg> {
     dfg: &'dfg DataFlowGraph,
 }
 
+#[derive(Clone, Copy)]
+enum RangeSource<'facts> {
+    Recursive,
+    Facts(&'facts Facts),
+}
+
+impl<'facts> RangeSource<'facts> {
+    fn range(self, analysis: &Analysis<'_>, value: ValueId) -> Option<Range> {
+        match self {
+            Self::Recursive => analysis.range(value),
+            Self::Facts(facts) => facts.range(value),
+        }
+    }
+
+    /// Use fallback ranges only during recursive analysis.
+    ///
+    /// Fixed-point propagation must not invent facts for missing operands.
+    fn range_or_fallback(
+        self,
+        analysis: &Analysis<'_>,
+        value: ValueId,
+        fallback: Range,
+    ) -> Option<Range> {
+        match self {
+            Self::Recursive => Some(analysis.range(value).unwrap_or(fallback)),
+            Self::Facts(facts) => facts.range(value),
+        }
+    }
+}
+
 impl<'dfg> Analysis<'dfg> {
     pub(super) fn new(dfg: &'dfg DataFlowGraph) -> Self {
         Self { dfg }
@@ -104,7 +134,11 @@ impl<'dfg> Analysis<'dfg> {
                         .copied();
 
                     if let Some(result) = result
-                        && let Some(range) = self.forward(instruction_data, result, &facts)
+                        && let Some(range) = self.instruction_range(
+                            instruction_data,
+                            result,
+                            RangeSource::Facts(&facts),
+                        )
                     {
                         changed |= facts.refine(self.dfg, result, range);
                     }
@@ -135,23 +169,29 @@ impl<'dfg> Analysis<'dfg> {
         facts.range(value)
     }
 
-    /// Compute an instruction result range from already-known operand ranges.
-    // TODO: Unify this with `range` once fallback-vs-bail semantics are directly covered.
-    fn forward(&self, instruction: &Instruction, result: ValueId, facts: &Facts) -> Option<Range> {
+    /// Compute an instruction result range from either recursive analysis or known facts.
+    fn instruction_range(
+        &self,
+        instruction: &Instruction,
+        result: ValueId,
+        source: RangeSource<'_>,
+    ) -> Option<Range> {
         let value_bit_size = self.dfg.type_of_value(result).bit_size();
 
         match instruction {
-            Instruction::Cast(original_value, _) => {
-                let original_range = facts.range(*original_value)?;
-                match self.dfg.type_of_value(result).as_ref() {
-                    Type::Numeric(NumericType::NativeField) => Some(original_range),
-                    Type::Numeric(NumericType::Unsigned { bit_size }) => {
-                        let max = max_unsigned_value_for_bit_size(*bit_size)?;
-                        Some(original_range.truncate_to(max))
-                    }
-                    _ => None,
+            Instruction::Cast(original_value, _) => match self.dfg.type_of_value(result).as_ref() {
+                Type::Numeric(NumericType::NativeField) => match source {
+                    RangeSource::Recursive => None,
+                    RangeSource::Facts(facts) => facts.range(*original_value),
+                },
+                Type::Numeric(NumericType::Unsigned { bit_size }) => {
+                    let max = max_unsigned_value_for_bit_size(*bit_size)?;
+                    let original_range =
+                        source.range_or_fallback(self, *original_value, Range::new(0, max))?;
+                    Some(original_range.truncate_to(max))
                 }
-            }
+                _ => None,
+            },
             Instruction::Truncate { value: original_value, bit_size, .. } => {
                 if !matches!(
                     self.dfg.type_of_value(result).as_ref(),
@@ -161,11 +201,12 @@ impl<'dfg> Analysis<'dfg> {
                 }
 
                 let max = max_unsigned_value_for_bit_size(value_bit_size.min(*bit_size))?;
-                let original_range = facts.range(*original_value)?;
+                let original_range =
+                    source.range_or_fallback(self, *original_value, Range::new(0, max))?;
                 Some(original_range.truncate_to(max))
             }
             Instruction::Binary(binary) => {
-                let ranges = self.binary_ranges(binary, value_bit_size, facts);
+                let ranges = self.binary_ranges(binary, value_bit_size, source);
                 binary.operator.forward(ranges)
             }
             Instruction::Not(original_value) => {
@@ -177,7 +218,8 @@ impl<'dfg> Analysis<'dfg> {
                 }
 
                 let type_max = max_unsigned_value_for_bit_size(value_bit_size)?;
-                let original_range = facts.range(*original_value)?;
+                let original_range =
+                    source.range_or_fallback(self, *original_value, Range::new(0, type_max))?;
                 Some(original_range.not(type_max))
             }
             _ => None,
@@ -222,7 +264,9 @@ impl<'dfg> Analysis<'dfg> {
             }
             Instruction::Binary(binary) => {
                 let value_bit_size = self.dfg.type_of_value(binary.lhs).bit_size();
-                let Some(ranges) = self.binary_ranges(binary, value_bit_size, facts) else {
+                let Some(ranges) =
+                    self.binary_ranges(binary, value_bit_size, RangeSource::Facts(facts))
+                else {
                     return false;
                 };
 
@@ -255,7 +299,6 @@ impl<'dfg> Analysis<'dfg> {
         if !matches!(value_type.as_ref(), Type::Numeric(_)) {
             return None;
         }
-        let value_bit_size = value_type.bit_size();
 
         match self.dfg[value] {
             Value::NumericConstant { constant, typ } => {
@@ -265,58 +308,18 @@ impl<'dfg> Analysis<'dfg> {
 
                 constant.try_into_u128().map(|value| Range::new(value, value))
             }
-            Value::Instruction { instruction, .. } => match &self.dfg[instruction] {
-                Instruction::Cast(original_value, _) => {
-                    if !matches!(
-                        self.dfg.type_of_value(value).as_ref(),
-                        Type::Numeric(NumericType::Unsigned { .. })
-                    ) {
-                        return None;
+            Value::Instruction { instruction, .. } => {
+                let instruction = &self.dfg[instruction];
+                match instruction {
+                    Instruction::Cast(..)
+                    | Instruction::Truncate { .. }
+                    | Instruction::Binary(_)
+                    | Instruction::Not(_) => {
+                        self.instruction_range(instruction, value, RangeSource::Recursive)
                     }
-
-                    let max = max_unsigned_value_for_bit_size(value_bit_size)?;
-                    let original_range = self.range(*original_value);
-
-                    Some(original_range.map_or(Range::new(0, max), |range| range.truncate_to(max)))
+                    _ => self.type_range(value),
                 }
-                Instruction::Truncate { value: original_value, bit_size, .. } => {
-                    if !matches!(
-                        self.dfg.type_of_value(value).as_ref(),
-                        Type::Numeric(NumericType::Unsigned { .. } | NumericType::NativeField)
-                    ) {
-                        return None;
-                    }
-
-                    let max = max_unsigned_value_for_bit_size(value_bit_size.min(*bit_size))?;
-                    let original_range = self.range(*original_value);
-
-                    Some(original_range.map_or(Range::new(0, max), |range| range.truncate_to(max)))
-                }
-                Instruction::Binary(binary) => {
-                    if !self.dfg.type_of_value(binary.lhs).unwrap_numeric().is_unsigned() {
-                        return None;
-                    }
-
-                    let lhs = self.range(binary.lhs)?;
-                    let rhs = self.range(binary.rhs)?;
-                    let ranges = BinaryRanges::new(value_bit_size, lhs, rhs);
-                    binary.operator.forward(ranges)
-                }
-                Instruction::Not(original_value) => {
-                    if !matches!(
-                        self.dfg.type_of_value(value).as_ref(),
-                        Type::Numeric(NumericType::Unsigned { .. })
-                    ) {
-                        return None;
-                    }
-
-                    let type_max = max_unsigned_value_for_bit_size(value_bit_size)?;
-                    let original_range =
-                        self.range(*original_value).unwrap_or_else(|| Range::new(0, type_max));
-                    Some(original_range.not(type_max))
-                }
-                _ => self.type_range(value),
-            },
+            }
             _ => self.type_range(value),
         }
     }
@@ -325,14 +328,14 @@ impl<'dfg> Analysis<'dfg> {
         &self,
         binary: &Binary,
         value_bit_size: u32,
-        facts: &Facts,
+        source: RangeSource<'_>,
     ) -> Option<BinaryRanges> {
         if !self.dfg.type_of_value(binary.lhs).unwrap_numeric().is_unsigned() {
             return None;
         }
 
-        let lhs = facts.range(binary.lhs)?;
-        let rhs = facts.range(binary.rhs)?;
+        let lhs = source.range(self, binary.lhs)?;
+        let rhs = source.range(self, binary.rhs)?;
         BinaryRanges::new(value_bit_size, lhs, rhs)
     }
 
@@ -812,6 +815,55 @@ mod tests {
         let range =
             Range::new(200, 254).increasing_result(Range::new(2, 2), 255, u128::checked_add);
         assert_eq!(range, Range::new(0, 255));
+    }
+
+    #[test]
+    fn recursive_source_uses_cast_fallback_but_facts_source_requires_a_known_range() {
+        let mut dfg = DataFlowGraph::default();
+        let block = dfg.make_block();
+        let original = dfg.add_block_parameter(block, Type::signed(16));
+        let result = dfg.add_block_parameter(block, Type::unsigned(8));
+        let facts = Facts::default();
+        let analysis = Analysis::new(&dfg);
+
+        let recursive_range = analysis.instruction_range(
+            &Instruction::Cast(original, NumericType::unsigned(8)),
+            result,
+            RangeSource::Recursive,
+        );
+        let facts_range = analysis.instruction_range(
+            &Instruction::Cast(original, NumericType::unsigned(8)),
+            result,
+            RangeSource::Facts(&facts),
+        );
+
+        assert_eq!(recursive_range, Some(Range::new(0, 255)));
+        assert_eq!(facts_range, None);
+    }
+
+    #[test]
+    fn field_casts_only_propagate_ranges_from_facts() {
+        let mut dfg = DataFlowGraph::default();
+        let block = dfg.make_block();
+        let original = dfg.add_block_parameter(block, Type::unsigned(8));
+        let result = dfg.add_block_parameter(block, Type::field());
+        let mut facts = Facts::default();
+        facts.set(original, Range::new(3, 7));
+        let analysis = Analysis::new(&dfg);
+
+        let recursive_range = analysis.instruction_range(
+            &Instruction::Cast(original, NumericType::NativeField),
+            result,
+            RangeSource::Recursive,
+        );
+        let facts_range = analysis.instruction_range(
+            &Instruction::Cast(original, NumericType::NativeField),
+            result,
+            RangeSource::Facts(&facts),
+        );
+
+        assert_eq!(recursive_range, None);
+        assert_eq!(facts_range, Some(Range::new(3, 7)));
     }
 
     #[test]
