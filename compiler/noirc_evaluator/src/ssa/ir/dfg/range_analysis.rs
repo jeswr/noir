@@ -3,21 +3,11 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::ssa::ir::{
     instruction::{Binary, BinaryOp, Instruction, InstructionId},
-    types::{NumericType, Type},
+    types::{NumericType, Type, max_unsigned_value_for_bit_size},
     value::{Value, ValueId},
 };
 
 use super::DataFlowGraph;
-
-/// Return the maximum unsigned value representable by `bit_size` bits.
-pub(crate) fn max_unsigned_value_for_bit_size(bit_size: u32) -> Option<u128> {
-    match bit_size {
-        0 => Some(0),
-        1..=127 => Some((1u128 << bit_size) - 1),
-        128 => Some(u128::MAX),
-        _ => None,
-    }
-}
 
 fn u128_num_bits(value: u128) -> u32 {
     u128::BITS - value.leading_zeros()
@@ -125,6 +115,7 @@ impl<'dfg> Analysis<'dfg> {
     }
 
     fn propagate(&self, facts: &mut Facts) {
+        // Safety bound; this normally exits early once no facts change.
         for _ in 0..=self.dfg.instructions.len() {
             let mut changed = false;
 
@@ -168,6 +159,7 @@ impl<'dfg> Analysis<'dfg> {
     }
 
     /// Compute an instruction result range from already-known operand ranges.
+    // TODO: Unify this with `range` once fallback-vs-bail semantics are directly covered.
     fn forward(&self, instruction: &Instruction, result: ValueId, facts: &Facts) -> Option<Range> {
         let value_bit_size = self.dfg.type_of_value(result).bit_size();
 
@@ -407,7 +399,7 @@ impl<'dfg> Analysis<'dfg> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Facts {
     ranges: HashMap<ValueId, Range>,
 }
@@ -426,10 +418,6 @@ impl Facts {
     /// Empty refinements are ignored. They can appear when independent conservative facts cannot
     /// overlap, and inventing a replacement singleton would make later inferences unsound.
     fn refine(&mut self, dfg: &DataFlowGraph, value: ValueId, range: Range) -> bool {
-        self.refine_bounds(dfg, value, range.min, range.max)
-    }
-
-    fn refine_bounds(&mut self, dfg: &DataFlowGraph, value: ValueId, min: u128, max: u128) -> bool {
         let value_type = dfg.type_of_value(value);
         let Type::Numeric(numeric_type) = value_type.as_ref() else {
             return false;
@@ -441,15 +429,15 @@ impl Facts {
 
         let type_max = match numeric_type {
             NumericType::Unsigned { bit_size } => max_unsigned_value_for_bit_size(*bit_size),
-            NumericType::NativeField => Some(max),
+            NumericType::NativeField => Some(range.max),
             NumericType::Signed { .. } => None,
         };
         let Some(type_max) = type_max else {
             return false;
         };
 
-        let min = min.min(type_max);
-        let max = max.min(type_max);
+        let min = range.min.min(type_max);
+        let max = range.max.min(type_max);
         if min > max {
             return false;
         }
@@ -477,7 +465,7 @@ impl Facts {
 ///
 /// These ranges are deliberately conservative: if an operation can overflow or truncate, the
 /// lower bound falls back to zero rather than assuming the overflowing case is unreachable.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Range {
     min: u128,
     max: u128,
