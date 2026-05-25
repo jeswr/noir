@@ -18,22 +18,6 @@ fn ceil_div(numerator: u128, denominator: u128) -> u128 {
     quotient + u128::from(numerator % denominator != 0)
 }
 
-fn signed_min_value(bit_size: u32) -> Option<i128> {
-    match bit_size {
-        1..=127 => Some(-(1i128 << (bit_size - 1))),
-        128 => Some(i128::MIN),
-        _ => None,
-    }
-}
-
-fn signed_max_value(bit_size: u32) -> Option<i128> {
-    match bit_size {
-        1..=127 => Some((1i128 << (bit_size - 1)) - 1),
-        128 => Some(i128::MAX),
-        _ => None,
-    }
-}
-
 fn sign_bit(bit_size: u32) -> Option<u128> {
     match bit_size {
         1..=128 => Some(1u128 << (bit_size - 1)),
@@ -390,18 +374,12 @@ impl<'dfg> Analysis<'dfg> {
         value_bit_size: u32,
         source: RangeSource<'_>,
     ) -> Option<BinaryRanges> {
-        let typ = self.dfg.type_of_value(binary.lhs).unwrap_numeric();
-        let lhs = source.range(self, binary.lhs)?;
-        let rhs = source.range(self, binary.rhs)?;
-        match typ {
-            NumericType::Unsigned { .. } => {
-                BinaryRanges::unsigned(value_bit_size, lhs.into_unsigned()?, rhs.into_unsigned()?)
-            }
-            NumericType::Signed { .. } => {
-                BinaryRanges::signed(value_bit_size, lhs.into_signed()?, rhs.into_signed()?)
-            }
-            NumericType::NativeField => None,
-        }
+        BinaryRanges::new(
+            self.dfg.type_of_value(binary.lhs).unwrap_numeric(),
+            value_bit_size,
+            source.range(self, binary.lhs)?,
+            source.range(self, binary.rhs)?,
+        )
     }
 
     fn type_range(&self, value: ValueId) -> Option<ValueRange> {
@@ -739,7 +717,11 @@ impl SignedRange {
     }
 
     fn for_bit_size(bit_size: u32) -> Option<Self> {
-        Some(Self::new(signed_min_value(bit_size)?, signed_max_value(bit_size)?))
+        match bit_size {
+            1..=127 => Some(Self::new(-(1i128 << (bit_size - 1)), (1i128 << (bit_size - 1)) - 1)),
+            128 => Some(Self::new(i128::MIN, i128::MAX)),
+            _ => None,
+        }
     }
 
     fn intersect(self, other: Self) -> Option<Self> {
@@ -847,15 +829,23 @@ enum BinaryRanges {
 }
 
 impl BinaryRanges {
-    fn unsigned(bit_size: u32, lhs: Range, rhs: Range) -> Option<Self> {
-        UnsignedBinaryRanges::new(bit_size, lhs, rhs).map(Self::Unsigned)
+    fn new(typ: NumericType, bit_size: u32, lhs: ValueRange, rhs: ValueRange) -> Option<Self> {
+        match typ {
+            NumericType::Unsigned { .. } => Some(Self::Unsigned(UnsignedBinaryRanges::new(
+                bit_size,
+                lhs.into_unsigned()?,
+                rhs.into_unsigned()?,
+            )?)),
+            NumericType::Signed { .. } => Some(Self::Signed(SignedBinaryRanges::new(
+                bit_size,
+                lhs.into_signed()?,
+                rhs.into_signed()?,
+            )?)),
+            NumericType::NativeField => None,
+        }
     }
 
-    fn signed(bit_size: u32, lhs: SignedRange, rhs: SignedRange) -> Option<Self> {
-        SignedBinaryRanges::new(bit_size, lhs, rhs).map(Self::Signed)
-    }
-
-    fn map_unsigned_signed(
+    fn map(
         self,
         unsigned: impl FnOnce(UnsignedBinaryRanges) -> Range,
         signed: impl FnOnce(SignedBinaryRanges) -> SignedRange,
@@ -867,39 +857,39 @@ impl BinaryRanges {
     }
 
     fn add(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::add, SignedBinaryRanges::add)
+        self.map(UnsignedBinaryRanges::add, SignedBinaryRanges::add)
     }
 
     fn sub(self, unchecked: bool) -> ValueRange {
-        self.map_unsigned_signed(|ranges| ranges.sub(unchecked), SignedBinaryRanges::sub)
+        self.map(|ranges| ranges.sub(unchecked), SignedBinaryRanges::sub)
     }
 
     fn mul(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::mul, SignedBinaryRanges::mul)
+        self.map(UnsignedBinaryRanges::mul, SignedBinaryRanges::mul)
     }
 
     fn div(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::div, SignedBinaryRanges::div)
+        self.map(UnsignedBinaryRanges::div, SignedBinaryRanges::div)
     }
 
     fn modulo(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::modulo, SignedBinaryRanges::modulo)
+        self.map(UnsignedBinaryRanges::modulo, SignedBinaryRanges::modulo)
     }
 
     fn bitand(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::bitand, SignedBinaryRanges::bitwise)
+        self.map(UnsignedBinaryRanges::bitand, SignedBinaryRanges::bitwise)
     }
 
     fn bit_or_xor(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::bit_or_xor, SignedBinaryRanges::bitwise)
+        self.map(UnsignedBinaryRanges::bit_or_xor, SignedBinaryRanges::bitwise)
     }
 
     fn shl(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::shl, SignedBinaryRanges::shl)
+        self.map(UnsignedBinaryRanges::shl, SignedBinaryRanges::shl)
     }
 
     fn shr(self) -> ValueRange {
-        self.map_unsigned_signed(UnsignedBinaryRanges::shr, SignedBinaryRanges::shr)
+        self.map(UnsignedBinaryRanges::shr, SignedBinaryRanges::shr)
     }
 }
 
@@ -1024,8 +1014,7 @@ impl SignedBinaryRanges {
     }
 
     fn div(self) -> SignedRange {
-        if self.rhs.contains(0) || (self.lhs.contains(self.type_range.min) && self.rhs.contains(-1))
-        {
+        if self.div_mod_can_fail() {
             return self.type_range;
         }
 
@@ -1033,8 +1022,7 @@ impl SignedBinaryRanges {
     }
 
     fn modulo(self) -> SignedRange {
-        if self.rhs.contains(0) || (self.lhs.contains(self.type_range.min) && self.rhs.contains(-1))
-        {
+        if self.div_mod_can_fail() {
             return self.type_range;
         }
 
@@ -1053,6 +1041,10 @@ impl SignedBinaryRanges {
 
     fn bitwise(self) -> SignedRange {
         self.type_range
+    }
+
+    fn div_mod_can_fail(self) -> bool {
+        self.rhs.contains(0) || (self.lhs.contains(self.type_range.min) && self.rhs.contains(-1))
     }
 
     fn shl(self) -> SignedRange {
