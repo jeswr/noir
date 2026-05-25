@@ -273,7 +273,8 @@ impl<'dfg> Analysis<'dfg> {
                 binary.operator.backward(BinaryBack {
                     dfg: self.dfg,
                     facts,
-                    binary,
+                    lhs: binary.lhs,
+                    rhs: binary.rhs,
                     result: result_range,
                     ranges,
                 })
@@ -373,14 +374,10 @@ impl Facts {
             return false;
         };
 
-        if numeric_type.is_signed() {
-            return false;
-        }
-
         let type_max = match numeric_type {
             NumericType::Unsigned { bit_size } => max_unsigned_value_for_bit_size(*bit_size),
             NumericType::NativeField => Some(range.max),
-            NumericType::Signed { .. } => None,
+            NumericType::Signed { .. } => return false,
         };
         let Some(type_max) = type_max else {
             return false;
@@ -564,7 +561,8 @@ impl BinaryRanges {
 struct BinaryBack<'a> {
     dfg: &'a DataFlowGraph,
     facts: &'a mut Facts,
-    binary: &'a Binary,
+    lhs: ValueId,
+    rhs: ValueId,
     result: Range,
     ranges: BinaryRanges,
 }
@@ -676,13 +674,13 @@ impl<'a> BinaryBack<'a> {
         Some(self.operands().tighten_lhs(Range::new(0, self.result.max >> shift)))
     }
 
-    fn apply(&mut self, operands: Option<OperandRanges>) -> bool {
+    fn apply(self, operands: Option<OperandRanges>) -> bool {
         let Some(operands) = operands else {
             return false;
         };
 
-        self.facts.refine(self.dfg, self.binary.lhs, operands.lhs)
-            | self.facts.refine(self.dfg, self.binary.rhs, operands.rhs)
+        self.facts.refine(self.dfg, self.lhs, operands.lhs)
+            | self.facts.refine(self.dfg, self.rhs, operands.rhs)
     }
 
     fn operands(&self) -> OperandRanges {
@@ -741,7 +739,7 @@ impl BinaryOp {
         }
     }
 
-    fn backward(self, mut back: BinaryBack<'_>) -> bool {
+    fn backward(self, back: BinaryBack<'_>) -> bool {
         let operands = match self {
             BinaryOp::Add { unchecked } => back.add(unchecked),
             BinaryOp::Sub { unchecked } => back.sub(unchecked),
@@ -770,7 +768,6 @@ mod tests {
         rhs_range: Range,
         result: Range,
         operator: BinaryOp,
-        operands: impl FnOnce(&BinaryBack<'_>) -> Option<OperandRanges>,
     ) -> (bool, Range, Range) {
         let ranges = BinaryRanges::new(bit_size, lhs_range, rhs_range).unwrap();
         let mut dfg = DataFlowGraph::default();
@@ -781,16 +778,13 @@ mod tests {
         let mut facts = Facts::default();
         facts.set(lhs, lhs_range);
         facts.set(rhs, rhs_range);
-        let binary = Binary { lhs, rhs, operator };
 
         let changed = {
-            let mut back =
-                BinaryBack { dfg: &dfg, facts: &mut facts, binary: &binary, result, ranges };
-            let operands = operands(&back);
-            back.apply(operands)
+            let back = BinaryBack { dfg: &dfg, facts: &mut facts, lhs, rhs, result, ranges };
+            operator.backward(back)
         };
 
-        (changed, facts.range(binary.lhs).unwrap(), facts.range(binary.rhs).unwrap())
+        (changed, facts.range(lhs).unwrap(), facts.range(rhs).unwrap())
     }
 
     #[test]
@@ -910,7 +904,6 @@ mod tests {
             Range::new(0, 255),
             Range::new(0, 15),
             BinaryOp::Add { unchecked: false },
-            |back| back.add(false),
         );
 
         assert!(changed);
@@ -926,7 +919,6 @@ mod tests {
             Range::new(0, 255),
             Range::new(10, 20),
             BinaryOp::Sub { unchecked: false },
-            |back| back.sub(false),
         );
 
         assert!(changed);
@@ -942,7 +934,6 @@ mod tests {
             Range::new(1, 255),
             Range::new(4, 20),
             BinaryOp::Mul { unchecked: false },
-            |back| back.mul(false),
         );
 
         assert!(changed);
@@ -952,14 +943,8 @@ mod tests {
 
     #[test]
     fn binary_back_div_refines_lhs_from_nonzero_rhs() {
-        let (changed, lhs, rhs) = apply_back(
-            8,
-            Range::new(0, 255),
-            Range::new(2, 10),
-            Range::new(3, 4),
-            BinaryOp::Div,
-            |back| back.div(),
-        );
+        let (changed, lhs, rhs) =
+            apply_back(8, Range::new(0, 255), Range::new(2, 10), Range::new(3, 4), BinaryOp::Div);
 
         assert!(changed);
         assert_eq!(lhs, Range::new(6, 49));
@@ -968,14 +953,8 @@ mod tests {
 
     #[test]
     fn binary_back_shl_refines_lhs_for_fixed_shift() {
-        let (changed, lhs, rhs) = apply_back(
-            8,
-            Range::new(0, 63),
-            Range::new(2, 2),
-            Range::new(0, 31),
-            BinaryOp::Shl,
-            |back| back.shl(),
-        );
+        let (changed, lhs, rhs) =
+            apply_back(8, Range::new(0, 63), Range::new(2, 2), Range::new(0, 31), BinaryOp::Shl);
 
         assert!(changed);
         assert_eq!(lhs, Range::new(0, 7));
