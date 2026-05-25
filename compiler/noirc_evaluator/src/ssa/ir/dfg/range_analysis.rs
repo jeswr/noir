@@ -127,10 +127,9 @@ impl<'dfg> Analysis<'dfg> {
 
     fn seed_range_checks(&self, facts: &mut Facts) {
         for (_, instruction) in self.dfg.instructions.iter() {
-            if let Instruction::RangeCheck { value, max_bit_size, .. } = instruction {
-                let Some(max) = max_unsigned_value_for_bit_size(*max_bit_size) else {
-                    continue;
-                };
+            if let Instruction::RangeCheck { value, max_bit_size, .. } = instruction
+                && let Some(max) = max_unsigned_value_for_bit_size(*max_bit_size)
+            {
                 facts.refine(self.dfg, *value, Range::new(0, max));
             }
         }
@@ -167,10 +166,10 @@ impl<'dfg> Analysis<'dfg> {
             self.dfg.results.get(&instruction).and_then(|results| results.first()).copied();
         let mut changed = false;
 
-        if let Some(result) = result {
-            if let Some(range) = self.forward(instruction_data, result, facts) {
-                changed |= facts.refine(self.dfg, result, range);
-            }
+        if let Some(result) = result
+            && let Some(range) = self.forward(instruction_data, result, facts)
+        {
+            changed |= facts.refine(self.dfg, result, range);
         }
 
         changed |= self.backward(instruction_data, result, facts);
@@ -293,10 +292,7 @@ impl<'dfg> Analysis<'dfg> {
     }
 
     fn propagate_equality(&self, lhs: ValueId, rhs: ValueId, facts: &mut Facts) -> bool {
-        let lhs_range = facts.range(lhs);
-        let rhs_range = facts.range(rhs);
-
-        match (lhs_range, rhs_range) {
+        match (facts.range(lhs), facts.range(rhs)) {
             (Some(lhs_range), Some(rhs_range)) => {
                 let Some(range) = lhs_range.intersect(rhs_range) else {
                     return false;
