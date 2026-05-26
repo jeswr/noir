@@ -1,6 +1,5 @@
 use acvm::AcirField;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::VecDeque;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::ssa::ir::{
     instruction::{
@@ -107,18 +106,16 @@ impl<'dfg> Analysis<'dfg> {
 
         let use_global_constraints =
             include_global_constraints && self.can_use_global_constraints();
-        let dependents = Dependents::new(self.dfg);
-        let mut worklist = Worklist::new(self.dfg);
 
-        while let Some(instruction) = worklist.pop() {
-            let changed_values = self.apply_instruction(
-                instruction,
-                &self.dfg[instruction],
-                &mut facts,
-                use_global_constraints,
-            );
-            for value in changed_values {
-                dependents.push_affected_by(value, &mut worklist);
+        // Safety cap for malformed fixed points; real propagation exits when no range narrows.
+        for _ in 0..=self.dfg.instructions.len() {
+            let mut changed = false;
+            for (instruction, data) in self.dfg.instructions.iter() {
+                changed |=
+                    self.apply_instruction(instruction, data, &mut facts, use_global_constraints);
+            }
+            if !changed {
+                break;
             }
         }
 
@@ -139,63 +136,77 @@ impl<'dfg> Analysis<'dfg> {
         instruction_data: &Instruction,
         facts: &mut Facts,
         include_global_constraints: bool,
-    ) -> Vec<ValueId> {
+    ) -> bool {
         let result =
             self.dfg.results.get(&instruction).and_then(|results| results.first()).copied();
-        let mut changed = Vec::new();
+        let mut changed = false;
 
         if let Some(result) = result
             && let Some(range) =
                 self.instruction_range(instruction_data, result, facts, include_global_constraints)
         {
-            self.refine(facts, result, range, &mut changed);
+            changed |= self.refine(facts, result, range);
         }
 
-        self.backward(instruction_data, result, facts, &mut changed);
+        changed |= self.backward(instruction_data, result, facts);
 
         if include_global_constraints {
-            self.apply_global_constraint(instruction_data, facts, &mut changed);
+            changed |= self.apply_global_constraint(instruction_data, facts);
         }
 
         changed
     }
 
-    fn refine(
-        &self,
-        facts: &mut Facts,
-        value: ValueId,
-        range: ValueRange,
-        changed: &mut Vec<ValueId>,
-    ) {
-        if facts.refine(self.dfg, value, range) {
-            changed.push(value);
-        }
+    fn refine(&self, facts: &mut Facts, value: ValueId, range: ValueRange) -> bool {
+        facts.refine(self.dfg, value, range)
     }
 
-    fn apply_global_constraint(
+    fn refine_pair(
         &self,
-        instruction: &Instruction,
         facts: &mut Facts,
-        changed: &mut Vec<ValueId>,
-    ) {
+        lhs: (ValueId, ValueRange),
+        rhs: (ValueId, ValueRange),
+    ) -> bool {
+        let lhs_changed = self.refine(facts, lhs.0, lhs.1);
+        let rhs_changed = self.refine(facts, rhs.0, rhs.1);
+        lhs_changed || rhs_changed
+    }
+
+    fn apply_global_constraint(&self, instruction: &Instruction, facts: &mut Facts) -> bool {
         match instruction {
             Instruction::RangeCheck { value, max_bit_size, .. } => {
-                if let Some(range) = self.range_check_range(*value, *max_bit_size) {
-                    self.refine(facts, *value, range, changed);
-                }
+                let Some(max) = max_unsigned_value_for_bit_size(*max_bit_size) else {
+                    return false;
+                };
+                let range = match self.dfg.type_of_value(*value).as_ref() {
+                    Type::Numeric(NumericType::Unsigned { .. } | NumericType::NativeField) => {
+                        Some(ValueRange::Unsigned(Range::new(0, max)))
+                    }
+                    Type::Numeric(NumericType::Signed { bit_size }) if max_bit_size < bit_size => {
+                        i128::try_from(max)
+                            .ok()
+                            .map(|max| ValueRange::Signed(SignedRange::new(0, max)))
+                    }
+                    Type::Numeric(NumericType::Signed { bit_size }) => {
+                        SignedRange::for_bit_size(*bit_size).map(ValueRange::Signed)
+                    }
+                    _ => None,
+                };
+                range.is_some_and(|range| self.refine(facts, *value, range))
             }
             Instruction::Constrain(lhs, rhs, _) => match (facts.range(*lhs), facts.range(*rhs)) {
                 (Some(lhs_range), Some(rhs_range)) => {
                     if let Some(range) = lhs_range.intersect(rhs_range) {
-                        self.refine(facts, *lhs, range, changed);
-                        self.refine(facts, *rhs, range, changed);
+                        self.refine_pair(facts, (*lhs, range), (*rhs, range))
+                    } else {
+                        false
                     }
                 }
-                (Some(range), None) => self.refine(facts, *rhs, range, changed),
-                (None, Some(range)) => self.refine(facts, *lhs, range, changed),
-                (None, None) => {}
+                (Some(range), None) => self.refine(facts, *rhs, range),
+                (None, Some(range)) => self.refine(facts, *lhs, range),
+                (None, None) => false,
             },
-            _ => {}
+            _ => false,
         }
     }
 
@@ -206,13 +217,12 @@ impl<'dfg> Analysis<'dfg> {
         instruction: &Instruction,
         result: Option<ValueId>,
         facts: &mut Facts,
-        changed: &mut Vec<ValueId>,
-    ) {
+    ) -> bool {
         let Some(result) = result else {
-            return;
+            return false;
         };
         let Some(result_range) = facts.range(result) else {
-            return;
+            return false;
         };
 
         match instruction {
@@ -235,30 +245,31 @@ impl<'dfg> Analysis<'dfg> {
                     _ => false,
                 };
                 if is_lossless_cast {
-                    self.refine(facts, *original_value, result_range, changed);
+                    self.refine(facts, *original_value, result_range)
+                } else {
+                    false
                 }
             }
             Instruction::Binary(binary) => {
                 let value_bit_size = self.dfg.type_of_value(binary.lhs).bit_size();
                 let Some(ranges) = self.binary_ranges(binary, value_bit_size, facts) else {
-                    return;
+                    return false;
                 };
 
-                if let Some(operands) =
-                    binary.operator.backward(BinaryBack::new(result_range, ranges))
-                {
-                    self.refine(facts, binary.lhs, operands.lhs, changed);
-                    self.refine(facts, binary.rhs, operands.rhs, changed);
+                if let Some(operands) = binary.operator.backward(result_range, ranges) {
+                    self.refine_pair(facts, (binary.lhs, operands.lhs), (binary.rhs, operands.rhs))
+                } else {
+                    false
                 }
             }
             Instruction::Not(original_value) => {
                 let original_type = self.dfg.type_of_value(*original_value);
                 let Some(range) = result_range.not(original_type.as_ref()) else {
-                    return;
+                    return false;
                 };
-                self.refine(facts, *original_value, range, changed);
+                self.refine(facts, *original_value, range)
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -316,7 +327,7 @@ impl<'dfg> Analysis<'dfg> {
                 binary.operator.forward(ranges)
             }
             Instruction::Not(original_value) => {
-                self.not_range(*original_value, result_type.as_ref(), value_bit_size, facts)
+                facts.range(*original_value)?.not(result_type.as_ref())
             }
             _ => None,
         }
@@ -324,14 +335,22 @@ impl<'dfg> Analysis<'dfg> {
 
     fn initial_range(&self, value: ValueId) -> Option<ValueRange> {
         let value_type = self.dfg.type_of_value(value);
-        if !matches!(value_type.as_ref(), Type::Numeric(_)) {
+        let Type::Numeric(numeric_type) = value_type.as_ref() else {
             return None;
-        }
+        };
 
         match self.dfg[value] {
-            Value::NumericConstant { constant, typ } => self.constant_range(constant, typ),
-            Value::Instruction { .. } => self.type_range(value),
-            _ => self.type_range(value),
+            Value::NumericConstant {
+                constant,
+                typ: NumericType::Unsigned { .. } | NumericType::NativeField,
+            } => {
+                constant.try_into_u128().map(|value| ValueRange::Unsigned(Range::new(value, value)))
+            }
+            Value::NumericConstant { constant, typ: NumericType::Signed { bit_size } } => {
+                signed_constant_value(constant, bit_size)
+                    .map(|value| ValueRange::Signed(SignedRange::new(value, value)))
+            }
+            _ => ValueRange::for_type(numeric_type),
         }
     }
 
@@ -347,41 +366,6 @@ impl<'dfg> Analysis<'dfg> {
             facts.range(binary.lhs)?,
             facts.range(binary.rhs)?,
         )
-    }
-
-    fn type_range(&self, value: ValueId) -> Option<ValueRange> {
-        let typ = self.dfg.type_of_value(value);
-        let Type::Numeric(numeric_type) = typ.as_ref() else {
-            return None;
-        };
-        ValueRange::for_type(numeric_type)
-    }
-
-    fn range_check_range(&self, value: ValueId, max_bit_size: u32) -> Option<ValueRange> {
-        let max = max_unsigned_value_for_bit_size(max_bit_size)?;
-        match self.dfg.type_of_value(value).as_ref() {
-            Type::Numeric(NumericType::Unsigned { .. } | NumericType::NativeField) => {
-                Some(ValueRange::Unsigned(Range::new(0, max)))
-            }
-            Type::Numeric(NumericType::Signed { bit_size }) if max_bit_size < *bit_size => {
-                let max = i128::try_from(max).ok()?;
-                Some(ValueRange::Signed(SignedRange::new(0, max)))
-            }
-            Type::Numeric(NumericType::Signed { bit_size }) => {
-                Some(ValueRange::Signed(SignedRange::for_bit_size(*bit_size)?))
-            }
-            _ => None,
-        }
-    }
-
-    fn constant_range(&self, constant: acvm::FieldElement, typ: NumericType) -> Option<ValueRange> {
-        match typ {
-            NumericType::Unsigned { .. } | NumericType::NativeField => {
-                constant.try_into_u128().map(|value| ValueRange::Unsigned(Range::new(value, value)))
-            }
-            NumericType::Signed { bit_size } => signed_constant_value(constant, bit_size)
-                .map(|value| ValueRange::Signed(SignedRange::new(value, value))),
-        }
     }
 
     fn truncate_range(
@@ -406,27 +390,6 @@ impl<'dfg> Analysis<'dfg> {
                 }
                 let max = i128::try_from(max_unsigned_value_for_bit_size(bit_size)?).ok()?;
                 Some(ValueRange::Signed(SignedRange::new(0, max)))
-            }
-            _ => None,
-        }
-    }
-
-    fn not_range(
-        &self,
-        original_value: ValueId,
-        result_type: &Type,
-        value_bit_size: u32,
-        facts: &Facts,
-    ) -> Option<ValueRange> {
-        match result_type {
-            Type::Numeric(NumericType::Unsigned { .. }) => {
-                let type_max = max_unsigned_value_for_bit_size(value_bit_size)?;
-                let original_range = facts.range(original_value)?;
-                Some(ValueRange::Unsigned(original_range.into_unsigned()?.not(type_max)))
-            }
-            Type::Numeric(NumericType::Signed { .. }) => {
-                let original_range = facts.range(original_value)?;
-                Some(ValueRange::Signed(original_range.into_signed()?.not()))
             }
             _ => None,
         }
@@ -598,63 +561,6 @@ impl Facts {
         } else {
             false
         }
-    }
-}
-
-struct Dependents {
-    by_value: HashMap<ValueId, Vec<InstructionId>>,
-}
-
-impl Dependents {
-    fn new(dfg: &DataFlowGraph) -> Self {
-        let mut by_value = HashMap::<_, Vec<_>>::default();
-
-        for (instruction, data) in dfg.instructions.iter() {
-            data.for_each_value(|value| by_value.entry(value).or_default().push(instruction));
-            // Result ranges can refine operands through the defining instruction.
-            if let Some(results) = dfg.results.get(&instruction) {
-                for &value in results {
-                    by_value.entry(value).or_default().push(instruction);
-                }
-            }
-        }
-
-        Self { by_value }
-    }
-
-    fn push_affected_by(&self, value: ValueId, worklist: &mut Worklist) {
-        if let Some(instructions) = self.by_value.get(&value) {
-            for &instruction in instructions {
-                worklist.push(instruction);
-            }
-        }
-    }
-}
-
-struct Worklist {
-    queued: HashSet<InstructionId>,
-    pending: VecDeque<InstructionId>,
-}
-
-impl Worklist {
-    fn new(dfg: &DataFlowGraph) -> Self {
-        let mut worklist = Self { queued: HashSet::default(), pending: VecDeque::new() };
-        for (instruction, _) in dfg.instructions.iter() {
-            worklist.push(instruction);
-        }
-        worklist
-    }
-
-    fn push(&mut self, instruction: InstructionId) {
-        if self.queued.insert(instruction) {
-            self.pending.push_back(instruction);
-        }
-    }
-
-    fn pop(&mut self) -> Option<InstructionId> {
-        let instruction = self.pending.pop_front()?;
-        self.queued.remove(&instruction);
-        Some(instruction)
     }
 }
 
@@ -1071,26 +977,6 @@ impl SignedBinaryRanges {
     }
 }
 
-/// Computes operand range proposals from a known binary result range.
-enum BinaryBack {
-    Unsigned(UnsignedBinaryBack),
-    Signed(SignedBinaryBack),
-}
-
-impl BinaryBack {
-    fn new(result: ValueRange, ranges: BinaryRanges) -> Option<Self> {
-        match (result, ranges) {
-            (ValueRange::Unsigned(result), BinaryRanges::Unsigned(ranges)) => {
-                Some(Self::Unsigned(UnsignedBinaryBack { result, ranges }))
-            }
-            (ValueRange::Signed(result), BinaryRanges::Signed(ranges)) => {
-                Some(Self::Signed(SignedBinaryBack { result, ranges }))
-            }
-            _ => None,
-        }
-    }
-}
-
 struct UnsignedBinaryBack {
     result: Range,
     ranges: UnsignedBinaryRanges,
@@ -1324,9 +1210,14 @@ impl BinaryOp {
         }
     }
 
-    fn backward(self, back: Option<BinaryBack>) -> Option<OperandRanges<ValueRange>> {
-        match back {
-            Some(BinaryBack::Unsigned(back)) => {
+    fn backward(
+        self,
+        result: ValueRange,
+        ranges: BinaryRanges,
+    ) -> Option<OperandRanges<ValueRange>> {
+        match (result, ranges) {
+            (ValueRange::Unsigned(result), BinaryRanges::Unsigned(ranges)) => {
+                let back = UnsignedBinaryBack { result, ranges };
                 let operands = match self {
                     BinaryOp::Add { unchecked } => back.add(unchecked),
                     BinaryOp::Sub { unchecked } => back.sub(unchecked),
@@ -1343,7 +1234,8 @@ impl BinaryOp {
                 };
                 operands.map(|operands| operands.map(ValueRange::Unsigned))
             }
-            Some(BinaryBack::Signed(back)) => {
+            (ValueRange::Signed(result), BinaryRanges::Signed(ranges)) => {
+                let back = SignedBinaryBack { result, ranges };
                 let operands = match self {
                     BinaryOp::Add { unchecked: false } => back.add(),
                     BinaryOp::Sub { unchecked: false } => back.sub(),
@@ -1351,7 +1243,7 @@ impl BinaryOp {
                 };
                 operands.map(|operands| operands.map(ValueRange::Signed))
             }
-            None => None,
+            _ => None,
         }
     }
 }
@@ -1374,7 +1266,7 @@ mod tests {
     ) -> (Range, Range) {
         let ranges = u8_ranges(lhs_range, rhs_range);
         let operands = operator
-            .backward(BinaryBack::new(ValueRange::Unsigned(result), BinaryRanges::Unsigned(ranges)))
+            .backward(ValueRange::Unsigned(result), BinaryRanges::Unsigned(ranges))
             .expect("u8 back-propagation should return operand ranges");
 
         (operands.lhs.into_unsigned().unwrap(), operands.rhs.into_unsigned().unwrap())
@@ -1602,10 +1494,7 @@ mod tests {
     fn binary_back_shl_does_not_refine_wrapping_shift() {
         let ranges = u8_ranges(Range::new(128, 255), Range::new(1, 1));
         let operands = BinaryOp::Shl
-            .backward(BinaryBack::new(
-                ValueRange::Unsigned(Range::new(0, 31)),
-                BinaryRanges::Unsigned(ranges),
-            ))
+            .backward(ValueRange::Unsigned(Range::new(0, 31)), BinaryRanges::Unsigned(ranges))
             .and_then(|operands| operands.lhs.into_unsigned());
 
         assert_eq!(operands, None);
