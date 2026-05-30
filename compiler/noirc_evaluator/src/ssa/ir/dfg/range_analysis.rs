@@ -86,6 +86,21 @@ impl<'dfg> Analysis<'dfg> {
             .map(|range| (range.min, range.max))
     }
 
+    /// Returns the inferred unsigned bounds for every value, computed in a single fixed point.
+    ///
+    /// A pass that queries many values should build this once instead of calling [`Self::bounds`]
+    /// per value, since each call re-runs the whole fixed point.
+    pub(super) fn unsigned_bounds(&self) -> HashMap<ValueId, (u128, u128)> {
+        let facts = self.infer_facts(true);
+        self.dfg
+            .values_iter()
+            .filter_map(|(value, _)| {
+                let range = facts.range(value).and_then(ValueRange::into_unsigned)?;
+                Some((value, (range.min, range.max)))
+            })
+            .collect()
+    }
+
     fn value_bits(&self, value: ValueId, facts: &Facts) -> u32 {
         let value_bit_size = self.dfg.type_of_value(value).bit_size();
         if let Some(range) = facts.range(value) {

@@ -569,6 +569,14 @@ impl DataFlowGraph {
         range_analysis::Analysis::new(self).bounds(value)
     }
 
+    /// Returns the inferred unsigned bounds for every value in a single fixed-point computation.
+    ///
+    /// Prefer this over repeated [`Self::get_unsigned_value_bounds`] when a pass queries many
+    /// values, since each individual call re-runs the analysis from scratch.
+    pub(crate) fn unsigned_value_bounds(&self) -> HashMap<ValueId, (u128, u128)> {
+        range_analysis::Analysis::new(self).unsigned_bounds()
+    }
+
     /// True if the type of this value is Type::Reference.
     /// Using this method over type_of_value avoids cloning the value's type.
     pub(crate) fn value_is_reference(&self, value: ValueId) -> bool {
@@ -1093,6 +1101,29 @@ mod tests {
         let main = ssa.main();
         let return_value = main.returns().unwrap()[0];
         main.dfg.get_value_max_num_bits(return_value)
+    }
+
+    #[test]
+    fn unsigned_value_bounds_snapshot_matches_per_value_query() {
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32):
+            range_check v0 to 8 bits
+            v2 = add v0, v1
+            return v2
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let main = ssa.main();
+        let snapshot = main.dfg.unsigned_value_bounds();
+
+        for (value, _) in main.dfg.values_iter() {
+            assert_eq!(
+                snapshot.get(&value).copied(),
+                main.dfg.get_unsigned_value_bounds(value),
+                "snapshot diverged from per-value query for {value}",
+            );
+        }
     }
 
     #[test]
