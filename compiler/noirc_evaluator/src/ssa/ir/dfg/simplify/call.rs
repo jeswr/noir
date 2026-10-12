@@ -393,7 +393,7 @@ pub(super) fn simplify_call(
                 bail_malformed!(dfg, "ApplyRangeConstraint bit-size must be a numeric constant");
             };
             let max_bit_size = max_bit_size.to_u128() as u32;
-            let max_potential_bits = dfg.get_value_max_num_bits(value);
+            let max_potential_bits = dfg.type_max_num_bits(value);
             if max_potential_bits < max_bit_size {
                 SimplifyResult::Remove
             } else {

@@ -62,6 +62,8 @@
 //! This case is similar to unsigned shift-left.
 use std::{borrow::Cow, sync::Arc};
 
+use rustc_hash::FxHashMap as HashMap;
+
 use acvm::{
     FieldElement,
     acir::{AcirField, brillig::lengths::SemanticLength},
@@ -98,6 +100,11 @@ impl Function {
             return;
         }
 
+        // The range analysis is a whole-function fixed point, so compute it once. Rewriting a
+        // shift never changes the range of an existing value; a value the rewrite creates is not
+        // in the snapshot and falls back to its type width.
+        let max_num_bits = self.dfg.value_max_num_bits();
+
         self.simple_optimization(|context| {
             let instruction_id = context.instruction_id;
             let instruction = context.instruction();
@@ -118,7 +125,7 @@ impl Function {
 
             let [old_result] = context.dfg.instruction_result(instruction_id);
 
-            let mut bitshift_context = Context { context };
+            let mut bitshift_context = Context { context, max_num_bits: &max_num_bits };
             bitshift_context.enforce_bitshift_rhs_lt_bit_size(rhs);
 
             let new_result = if operator == BinaryOp::Shl {
@@ -137,14 +144,24 @@ impl Function {
 
 struct Context<'m, 'dfg, 'mapping> {
     context: &'m mut SimpleOptimizationContext<'dfg, 'mapping>,
+    max_num_bits: &'m HashMap<ValueId, u32>,
 }
 
 impl Context<'_, '_, '_> {
+    /// The maximum number of bits `value` can occupy, from the range analysis snapshot taken
+    /// before the pass, or from its type for a value the pass created.
+    fn max_num_bits(&self, value: ValueId) -> u32 {
+        self.max_num_bits
+            .get(&value)
+            .copied()
+            .unwrap_or_else(|| self.context.dfg.type_max_num_bits(value))
+    }
+
     /// Insert SSA instructions which computes lhs << rhs by doing lhs*2^rhs
     /// and truncate the result to `bit_size`.
     fn insert_wrapping_shift_left(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
         let typ = self.context.dfg.type_of_value(lhs).unwrap_numeric();
-        let max_lhs_bits = self.context.dfg.get_value_max_num_bits(lhs);
+        let max_lhs_bits = self.max_num_bits(lhs);
         let max_bit_shift_size = self.context.dfg.get_numeric_constant(rhs).map_or_else(
             || {
                 // If we don't know `rhs`'s value then it could be anything up to the number
@@ -153,7 +170,7 @@ impl Context<'_, '_, '_> {
                 // bits than the RHS; e.g. because it was upcast from a u1 to a u32.
                 // The maximum value we can get would be `2^bits - 1`, but `u1` is the only interesting case,
                 // because even for u8 the max value is 255, larger than anything we get based on type.
-                if self.context.dfg.get_value_max_num_bits(rhs) == 1 {
+                if self.max_num_bits(rhs) == 1 {
                     1
                 } else {
                     self.context.dfg.type_of_value(rhs).bit_size()
@@ -344,7 +361,7 @@ impl Context<'_, '_, '_> {
         //   which is even larger than the largest unsigned type u128, so nothing better can be done here
         // - the exception would be casting a `u1` to a larger type, where we know the exponent can be
         //   either zero or one, which we special-case here
-        let max_exponent_bits = if self.context.dfg.get_value_max_num_bits(exponent) == 1 {
+        let max_exponent_bits = if self.max_num_bits(exponent) == 1 {
             1
         } else {
             let exponent_bit_size = self.context.dfg.type_of_value(exponent).bit_size();
