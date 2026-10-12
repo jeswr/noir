@@ -2513,7 +2513,7 @@ mod tests {
             enable_side_effects v5
             v8 = cast v2 as Field
             v10 = add v8, Field 1
-            v11 = truncate v10 to 8 bits, max_bit_size: 254
+            v11 = truncate v10 to 8 bits, max_bit_size: 9
             v12 = cast v11 as u8
             v13 = load v6 -> u8
             v14 = not v5

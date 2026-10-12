@@ -212,6 +212,24 @@ pub(crate) fn simplify(
             if bit_size >= max_bit_size {
                 return SimplifiedTo(*value);
             }
+            // A `Field` value may be known to be narrower than the declared maximum, e.g. a sum
+            // of two cast integers. Truncating it then needs a smaller quotient check.
+            let known_bits =
+                if matches!(*dfg.type_of_value(*value), Type::Numeric(NumericType::NativeField)) {
+                    dfg.field_value_max_num_bits(*value)
+                } else {
+                    *max_bit_size
+                };
+            if known_bits <= *bit_size {
+                return SimplifiedTo(*value);
+            }
+            if known_bits < *max_bit_size {
+                return SimplifiedToInstruction(Instruction::Truncate {
+                    value: *value,
+                    bit_size: *bit_size,
+                    max_bit_size: known_bits,
+                });
+            }
             if let Some((numeric_constant, typ)) = dfg.get_numeric_constant_with_type(*value) {
                 let truncated_field = truncate_field(numeric_constant, *bit_size);
                 SimplifiedTo(dfg.make_constant(truncated_field, typ))
@@ -805,6 +823,155 @@ mod tests {
           b0(v0: u8):
             v1 = cast v0 as u16
             return v1
+        }
+        ");
+    }
+
+    #[test]
+    fn truncate_of_field_sum_of_casts_uses_the_sum_width() {
+        // Chained `wrapping_add`s on u32 lower to this: the field sum of two reduced u32s fits in
+        // 33 bits, so the truncation only needs a one-bit quotient, not one sized to the field.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32):
+            v2 = xor v0, v1
+            v3 = and v0, v1
+            v4 = cast v2 as Field
+            v5 = cast v3 as Field
+            v6 = add v4, v5
+            v7 = truncate v6 to 32 bits, max_bit_size: 254
+            v8 = cast v7 as u32
+            v9 = cast v8 as Field
+            v10 = add v9, v4
+            v11 = truncate v10 to 32 bits, max_bit_size: 254
+            return v11
+        }
+        ";
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32):
+            v2 = xor v0, v1
+            v3 = and v0, v1
+            v4 = cast v2 as Field
+            v5 = cast v3 as Field
+            v6 = add v4, v5
+            v7 = truncate v6 to 32 bits, max_bit_size: 33
+            v8 = cast v7 as u32
+            v9 = add v7, v4
+            v10 = truncate v9 to 32 bits, max_bit_size: 33
+            return v10
+        }
+        ");
+    }
+
+    #[test]
+    fn truncate_of_field_product_of_casts_uses_the_product_width() {
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32, v2: u8, v3: u8):
+            v4 = xor v0, v1
+            v5 = xor v2, v3
+            v6 = cast v4 as Field
+            v7 = cast v5 as Field
+            v8 = mul v6, v7
+            v9 = truncate v8 to 32 bits, max_bit_size: 254
+            return v9
+        }
+        ";
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32, v2: u8, v3: u8):
+            v4 = xor v0, v1
+            v5 = xor v2, v3
+            v6 = cast v4 as Field
+            v7 = cast v5 as Field
+            v8 = mul v6, v7
+            v9 = truncate v8 to 32 bits, max_bit_size: 40
+            return v9
+        }
+        ");
+    }
+
+    #[test]
+    fn truncate_of_field_sum_of_cast_parameters_keeps_the_field_width() {
+        // A block parameter may carry an unreduced value, such as a loop index advanced by
+        // `unchecked_add`, so its type width is not a bound.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32):
+            v2 = cast v0 as Field
+            v3 = cast v1 as Field
+            v4 = add v2, v3
+            v5 = truncate v4 to 32 bits, max_bit_size: 254
+            return v5
+        }
+        ";
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32):
+            v2 = cast v0 as Field
+            v3 = cast v1 as Field
+            v4 = add v2, v3
+            v5 = truncate v4 to 32 bits, max_bit_size: 254
+            return v5
+        }
+        ");
+    }
+
+    #[test]
+    fn truncate_of_field_sum_with_an_unbounded_operand_keeps_the_field_width() {
+        // A Field parameter can hold any field element, so the sum is unbounded.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: Field):
+            v2 = cast v0 as Field
+            v3 = add v2, v1
+            v4 = truncate v3 to 32 bits, max_bit_size: 254
+            return v4
+        }
+        ";
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: Field):
+            v2 = cast v0 as Field
+            v3 = add v2, v1
+            v4 = truncate v3 to 32 bits, max_bit_size: 254
+            return v4
+        }
+        ");
+    }
+
+    #[test]
+    fn truncate_of_field_sum_of_unchecked_results_keeps_the_field_width() {
+        // An unchecked u32 add can exceed 32 bits in ACIR, so its cast is not a 32-bit bound.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32):
+            v2 = unchecked_add v0, v1
+            v3 = cast v2 as Field
+            v4 = add v3, v3
+            v5 = truncate v4 to 32 bits, max_bit_size: 254
+            return v5
+        }
+        ";
+        let ssa = Ssa::from_str_simplifying(src).unwrap();
+
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u32, v1: u32):
+            v2 = unchecked_add v0, v1
+            v3 = cast v2 as Field
+            v4 = add v3, v3
+            v5 = truncate v4 to 32 bits, max_bit_size: 254
+            return v5
         }
         ");
     }

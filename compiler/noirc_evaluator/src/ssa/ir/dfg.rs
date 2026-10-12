@@ -639,6 +639,80 @@ impl DataFlowGraph {
         }
     }
 
+    /// Upper bound on the number of bits a `Field` value may hold, for values built by `Field`
+    /// additions and multiplications of integers cast to `Field` (as `wrapping_add` and
+    /// `wrapping_mul` lower). A sum needs one more bit than its widest operand and a product the
+    /// sum of its operands' widths.
+    ///
+    /// The walk stops after a few nested operations and then reports the field width, so its cost
+    /// stays constant however the values are shared.
+    pub(crate) fn field_value_max_num_bits(&self, value: ValueId) -> u32 {
+        self.field_value_max_num_bits_within(value, 4)
+    }
+
+    fn field_value_max_num_bits_within(&self, value: ValueId, depth: u32) -> u32 {
+        let field_max = FieldElement::max_num_bits();
+        if depth == 0 {
+            return field_max;
+        }
+        if let Value::Instruction { instruction, .. } = self[value]
+            && let Instruction::Binary(binary) = &self[instruction]
+            && matches!(binary.operator, BinaryOp::Add { .. } | BinaryOp::Mul { .. })
+            && matches!(*self.type_of_value(value), Type::Numeric(NumericType::NativeField))
+        {
+            let lhs_bits = self.field_value_max_num_bits_within(binary.lhs, depth - 1);
+            let rhs_bits = self.field_value_max_num_bits_within(binary.rhs, depth - 1);
+            let bound = match binary.operator {
+                BinaryOp::Add { .. } => lhs_bits.max(rhs_bits).saturating_add(1),
+                _ => lhs_bits.saturating_add(rhs_bits),
+            };
+            // At the field width the value may have wrapped, so nothing is known.
+            if bound >= field_max { field_max } else { bound }
+        } else {
+            self.reduced_max_num_bits(value)
+        }
+    }
+
+    /// Upper bound on the number of bits of the field value behind `value`, trusting the static
+    /// type width only where the value is known to be reduced to it. Block parameters and
+    /// unchecked ACIR arithmetic may carry an unreduced value (such as a loop index advanced by
+    /// `unchecked_add`), and a cast keeps its operand's field value, so both are traced to their
+    /// source: a truncation bounds by its bit size, other instructions by their type width.
+    fn reduced_max_num_bits(&self, value: ValueId) -> u32 {
+        let field_max = FieldElement::max_num_bits();
+        match self[value] {
+            Value::NumericConstant { constant, .. } => constant.num_bits(),
+            Value::Instruction { instruction, .. } => match &self[instruction] {
+                Instruction::Truncate { bit_size, .. } => {
+                    (*bit_size).min(self.type_of_value(value).bit_size())
+                }
+                Instruction::Cast(original, _) => {
+                    let original_type = self.type_of_value(*original);
+                    // A widening cast of a signed value may sign-extend it.
+                    if original_type.is_signed()
+                        && self.type_of_value(value).bit_size() > original_type.bit_size()
+                    {
+                        field_max
+                    } else {
+                        self.reduced_max_num_bits(*original)
+                    }
+                }
+                Instruction::Binary(binary)
+                    if matches!(
+                        binary.operator,
+                        BinaryOp::Add { unchecked: true }
+                            | BinaryOp::Sub { unchecked: true }
+                            | BinaryOp::Mul { unchecked: true }
+                    ) =>
+                {
+                    field_max
+                }
+                _ => self.type_of_value(value).bit_size(),
+            },
+            _ => field_max,
+        }
+    }
+
     /// Upper bound on the number of bits an operand of an unchecked ACIR arithmetic instruction
     /// may hold.
     ///

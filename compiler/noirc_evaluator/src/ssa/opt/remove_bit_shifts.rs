@@ -1222,7 +1222,7 @@ mod tests {
             v3 = mul v1, Field 9223372036854775808
             v4 = truncate v3 to 128 bits, max_bit_size: 254
             v6 = mul v4, Field 18446744073709551616
-            v7 = truncate v6 to 128 bits, max_bit_size: 254
+            v7 = truncate v6 to 128 bits, max_bit_size: 193
             v8 = cast v7 as u128
             return v8
         }
