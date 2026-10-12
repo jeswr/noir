@@ -630,6 +630,12 @@ impl DataFlowGraph {
                         };
                         bound.min(field_max)
                     }
+                    Instruction::Truncate { value: original_value, bit_size, .. } => {
+                        // A truncation bounds its result to `bit_size` bits, and the result
+                        // can never require more bits than the value being truncated.
+                        let original_bit_size = self.get_value_max_num_bits(*original_value);
+                        value_bit_size.min(*bit_size).min(original_bit_size)
+                    }
                     _ => value_bit_size,
                 }
             }
