@@ -69,6 +69,7 @@ mod tests {
         acir(inline) fn main f0 {
           b0(v0: u8, v1: u8):
             v2 = unchecked_add v0, v1
+            range_check v2 to 8 bits
             return v2
         }
         ");
@@ -93,6 +94,7 @@ mod tests {
           b0(v0: u1, v1: u1):
             v2 = unchecked_add v0, v1
             v3 = cast v2 as Field
+            range_check v3 to 1 bits
             return v3
         }
         ");

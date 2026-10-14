@@ -500,7 +500,7 @@ mod tests {
           b0(v0: u1, v1: u1):
             v2 = unchecked_sub v0, v1
             v3 = cast v2 as u32
-            v5 = unchecked_sub u32 1, v3
+            v5 = sub u32 1, v3
             return v5
         }
         ");
@@ -552,7 +552,7 @@ mod tests {
           b0(v0: u1, v1: u1, v2: u8):
             v3 = unchecked_add v0, v1
             v4 = cast v3 as u8
-            v5 = mul v4, v2
+            v5 = unchecked_mul v4, v2
             return v5
         }
         ");
@@ -581,7 +581,7 @@ mod tests {
             v4 = unchecked_mul v3, v1
             v5 = unchecked_add v0, v4
             v6 = cast v5 as u8
-            v7 = mul v6, v2
+            v7 = unchecked_mul v6, v2
             return v7
         }
         ");
@@ -642,10 +642,27 @@ mod tests {
             v3 = unchecked_add v0, v1
             v4 = not v3
             v5 = cast v4 as u8
-            v6 = unchecked_mul v5, v2
+            v6 = mul v5, v2
             return v6
         }
         ");
+    }
+
+    #[test]
+    fn long_chain_falls_back_to_the_field_width_in_acir() {
+        // Past the depth limit the bound is the field width, so the add stays checked even though
+        // every product in the chain is a single bit.
+        let mut src = String::from("acir(inline) fn main f0 {\n  b0(v0: u1, v1: u8):\n");
+        src.push_str("    v2 = unchecked_mul v0, v0\n");
+        for i in 3..1203 {
+            src.push_str(&format!("    v{i} = unchecked_mul v{}, v0\n", i - 1));
+        }
+        src.push_str("    v1203 = cast v1202 as u32\n    v1204 = cast v1 as u32\n");
+        src.push_str("    v1205 = add v1203, v1204\n    return v1205\n}\n");
+        let ssa = Ssa::from_str(&src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        let printed = ssa.to_string();
+        assert!(printed.contains("v1205 = add v1203, v1204"), "{printed}");
     }
 
     #[test]
@@ -667,7 +684,7 @@ mod tests {
           b0(v0: u8, v1: u8, v2: u1):
             v3 = unchecked_add v0, v1
             v4 = cast v2 as u8
-            v5 = unchecked_mul v3, v4
+            v5 = mul v3, v4
             return v5
         }
         ");

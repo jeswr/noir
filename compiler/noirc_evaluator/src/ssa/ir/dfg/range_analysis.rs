@@ -20,6 +20,8 @@
 //! executes, so they run only when every instruction executes unconditionally (a single block with
 //! no predication). Forward inference is always sound and always runs.
 
+use std::cell::RefCell;
+
 use acvm::AcirField;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -79,27 +81,62 @@ fn unsigned_to_signed(value: u128, bit_size: u32) -> Option<i128> {
     }
 }
 
-/// True when `value` is the result of an unchecked unsigned `add` or `mul`.
+/// How many unchecked operations, `not`s and casts [`Analysis::exact_range`] follows before it
+/// gives up on a bound, so that a long chain cannot make the analysis quadratic or exhaust the stack.
+const MAX_EXACT_DEPTH: usize = 256;
+
+/// True when `value` may hold a field element outside its type's range.
 ///
-/// Such an operation does not truncate, so its exact value can exceed the value's own type range.
-/// Stored ranges stay clamped to the type so the type-relative range arithmetic keeps its
-/// invariants; only a widening cast, which preserves the exact value, recovers the untruncated
-/// bound (see [`Analysis::untruncated_range`]). Restricted to unsigned values: signed overflow has
-/// already been made explicit by `expand_signed_checks`.
-fn unchecked_arithmetic_can_exceed_type(dfg: &DataFlowGraph, value: ValueId) -> bool {
-    if !matches!(dfg.type_of_value(value).as_ref(), Type::Numeric(NumericType::Unsigned { .. })) {
+/// In ACIR, unchecked unsigned `add`, `sub` and `mul` are not reduced to the type width: an add or
+/// mul can exceed the type's maximum, and a sub can underflow to a field-negative value. A `not` of
+/// such a value, and a cast of it, which is a no-op in ACIR, carry the same problem. In Brillig
+/// these results wrap to the type width. Signed overflow has already been made explicit by
+/// `expand_signed_checks`.
+///
+/// The fact stored for such a value is clamped to its type, so it is not a bound on the value. It
+/// is read only through [`Analysis::exact_range`].
+fn may_exceed_type(dfg: &DataFlowGraph, value: ValueId) -> bool {
+    if !dfg.runtime().is_acir() {
         return false;
     }
-    let Value::Instruction { instruction, .. } = dfg[value] else {
+    let Some(instruction) = dfg.get_local_or_global_instruction(value) else {
         return false;
     };
-    matches!(
-        dfg[instruction],
+    match *instruction {
         Instruction::Binary(Binary {
-            operator: BinaryOp::Add { unchecked: true } | BinaryOp::Mul { unchecked: true },
+            operator:
+                BinaryOp::Add { unchecked: true }
+                | BinaryOp::Sub { unchecked: true }
+                | BinaryOp::Mul { unchecked: true },
             ..
-        })
-    )
+        }) => {
+            matches!(dfg.type_of_value(value).as_ref(), Type::Numeric(NumericType::Unsigned { .. }))
+        }
+        Instruction::Not(operand) | Instruction::Cast(operand, _) => {
+            matches!(
+                dfg.type_of_value(value).as_ref(),
+                Type::Numeric(NumericType::Unsigned { .. } | NumericType::NativeField)
+            ) && may_exceed_type(dfg, operand)
+        }
+        _ => false,
+    }
+}
+
+/// The ways `term` can be read as `condition * payload`: a product of two values, either way
+/// round, or `term` itself as a condition with an implicit payload of 1.
+fn selector_terms(dfg: &DataFlowGraph, term: ValueId) -> Vec<(ValueId, Option<ValueId>)> {
+    let mut terms = vec![(term, None)];
+    if let Some(&Instruction::Binary(Binary { lhs, operator: BinaryOp::Mul { .. }, rhs })) =
+        dfg.get_local_or_global_instruction(term)
+    {
+        terms.push((lhs, Some(rhs)));
+        terms.push((rhs, Some(lhs)));
+    }
+    terms
+}
+
+fn is_not_of(dfg: &DataFlowGraph, value: ValueId, of: ValueId) -> bool {
+    dfg.get_local_or_global_instruction(value) == Some(&Instruction::Not(of))
 }
 
 /// Computes conservative numeric value ranges for SSA values.
@@ -137,7 +174,11 @@ impl<'dfg> Analysis<'dfg> {
         self.dfg
             .values_iter()
             .filter_map(|(value, _)| {
-                let range = facts.range(value).and_then(ValueRange::into_unsigned)?;
+                let range = if may_exceed_type(self.dfg, value) {
+                    self.exact_range(value, &facts)?
+                } else {
+                    facts.range(value).and_then(ValueRange::into_unsigned)?
+                };
                 Some((value, (range.min, range.max)))
             })
             .collect()
@@ -170,6 +211,12 @@ impl<'dfg> Analysis<'dfg> {
 
     fn value_bits(&self, value: ValueId, facts: &Facts) -> u32 {
         let value_bit_size = self.dfg.type_of_value(value).bit_size();
+        if may_exceed_type(self.dfg, value) {
+            let field_bits = acvm::FieldElement::max_num_bits();
+            return self
+                .exact_range(value, facts)
+                .map_or(field_bits, |range| range.max_bits().min(field_bits));
+        }
         if let Some(range) = facts.range(value) {
             return value_bit_size.min(range.max_bits(value_bit_size));
         }
@@ -249,7 +296,10 @@ impl<'dfg> Analysis<'dfg> {
             self.dfg.results.get(&instruction).and_then(|results| results.first()).copied();
         let mut changed = false;
 
+        // The stored fact of a value that may exceed its type is never read as a bound (see
+        // `may_exceed_type`), so it is left at the type range.
         if let Some(result) = result
+            && !may_exceed_type(self.dfg, result)
             && let Some(range) =
                 self.instruction_range(instruction_data, result, facts, include_global_constraints)
         {
@@ -304,18 +354,20 @@ impl<'dfg> Analysis<'dfg> {
                 };
                 range.is_some_and(|range| self.refine(facts, *value, range))
             }
-            Instruction::Constrain(lhs, rhs, _) => match (facts.range(*lhs), facts.range(*rhs)) {
-                (Some(lhs_range), Some(rhs_range)) => {
-                    if let Some(range) = lhs_range.intersect(rhs_range) {
-                        self.refine_pair(facts, (*lhs, range), (*rhs, range))
-                    } else {
-                        false
+            Instruction::Constrain(lhs, rhs, _) => {
+                match (self.operand_range(*lhs, facts), self.operand_range(*rhs, facts)) {
+                    (Some(lhs_range), Some(rhs_range)) => {
+                        if let Some(range) = lhs_range.intersect(rhs_range) {
+                            self.refine_pair(facts, (*lhs, range), (*rhs, range))
+                        } else {
+                            false
+                        }
                     }
+                    (Some(range), None) => self.refine(facts, *rhs, range),
+                    (None, Some(range)) => self.refine(facts, *lhs, range),
+                    (None, None) => false,
                 }
-                (Some(range), None) => self.refine(facts, *rhs, range),
-                (None, Some(range)) => self.refine(facts, *lhs, range),
-                (None, None) => false,
-            },
+            }
             _ => false,
         }
     }
@@ -331,7 +383,7 @@ impl<'dfg> Analysis<'dfg> {
         let Some(result) = result else {
             return false;
         };
-        let Some(result_range) = facts.range(result) else {
+        let Some(result_range) = self.operand_range(result, facts) else {
             return false;
         };
 
@@ -383,32 +435,144 @@ impl<'dfg> Analysis<'dfg> {
         }
     }
 
-    /// The range of `value`, recovering the untruncated bound when `value` is an unchecked unsigned
-    /// add or multiply.
-    ///
-    /// The fact stored for such a value is clamped to its type, but the operation does not truncate,
-    /// so its exact value can be wider. Only a widening cast consumes this range, and it re-clamps
-    /// the result to the destination type, so the wider bound never reaches the type-relative range
-    /// arithmetic that assumes a value fits its own type. For every other value this is just the
-    /// stored fact.
-    fn untruncated_range(&self, value: ValueId, facts: &Facts) -> Option<ValueRange> {
-        if !unchecked_arithmetic_can_exceed_type(self.dfg, value) {
+    /// A sound bound on the field element `value` holds, which may exceed its type's range when
+    /// [`may_exceed_type`] holds. `None` when there is no bound, such as for a sub that may
+    /// underflow to a field-negative value.
+    fn exact_range(&self, value: ValueId, facts: &Facts) -> Option<Range> {
+        self.exact_range_in(value, facts, 0, &RefCell::default())
+    }
+
+    /// [`Self::exact_range`], memoized in `cache` so that a value reached along many paths is
+    /// bounded once.
+    fn exact_range_in(
+        &self,
+        value: ValueId,
+        facts: &Facts,
+        depth: usize,
+        cache: &RefCell<HashMap<ValueId, Option<Range>>>,
+    ) -> Option<Range> {
+        if let Some(range) = cache.borrow().get(&value) {
+            return *range;
+        }
+        let range = self.compute_exact_range(value, facts, depth, cache);
+        cache.borrow_mut().insert(value, range);
+        range
+    }
+
+    fn compute_exact_range(
+        &self,
+        value: ValueId,
+        facts: &Facts,
+        depth: usize,
+        cache: &RefCell<HashMap<ValueId, Option<Range>>>,
+    ) -> Option<Range> {
+        if !may_exceed_type(self.dfg, value) {
+            return facts.range(value).and_then(ValueRange::into_unsigned);
+        }
+        if depth >= MAX_EXACT_DEPTH {
+            return None;
+        }
+        let instruction = self.dfg.get_local_or_global_instruction(value)?;
+        let exact = |operand| self.exact_range_in(operand, facts, depth + 1, cache);
+        let range = match *instruction {
+            Instruction::Binary(Binary { lhs, operator, rhs }) => match operator {
+                BinaryOp::Add { .. } => match self.selection_range(lhs, rhs, facts, depth, cache) {
+                    Some(range) => range,
+                    None => {
+                        let (lhs, rhs) = (exact(lhs)?, exact(rhs)?);
+                        Range::new(lhs.min.checked_add(rhs.min)?, lhs.max.checked_add(rhs.max)?)
+                    }
+                },
+                BinaryOp::Mul { .. } => {
+                    let (lhs, rhs) = (exact(lhs)?, exact(rhs)?);
+                    Range::new(lhs.min.checked_mul(rhs.min)?, lhs.max.checked_mul(rhs.max)?)
+                }
+                BinaryOp::Sub { .. } => {
+                    let (lhs, rhs) = (exact(lhs)?, exact(rhs)?);
+                    if lhs.min < rhs.max {
+                        return None;
+                    }
+                    Range::new(lhs.min - rhs.max, lhs.max - rhs.min)
+                }
+                _ => return None,
+            },
+            Instruction::Not(operand) => {
+                let type_max = self.unsigned_type_max(value)?;
+                let range = exact(operand)?;
+                if range.max > type_max {
+                    return None;
+                }
+                range.not(type_max)
+            }
+            Instruction::Cast(operand, _) => exact(operand)?,
+            _ => return None,
+        };
+
+        // When the bound fits the type, the stored fact, which constraints may have narrowed, also
+        // bounds the value.
+        let fits_type = self.unsigned_type_max(value).is_none_or(|type_max| range.max <= type_max);
+        let fact = facts.range(value).and_then(ValueRange::into_unsigned);
+        match fact {
+            Some(fact) if fits_type => Some(range.intersect(fact).unwrap_or(range)),
+            _ => Some(range),
+        }
+    }
+
+    /// The bound on `lhs + rhs` when it selects between two values, `c * a + not(c) * b` with `c`
+    /// a bit, as built when merging the branches of an `if`: at most one term is non-zero.
+    fn selection_range(
+        &self,
+        lhs: ValueId,
+        rhs: ValueId,
+        facts: &Facts,
+        depth: usize,
+        cache: &RefCell<HashMap<ValueId, Option<Range>>>,
+    ) -> Option<Range> {
+        let exact = |operand| self.exact_range_in(operand, facts, depth + 1, cache);
+        let is_bit = |operand| exact(operand).is_some_and(|range: Range| range.max <= 1);
+        for (lhs_condition, lhs_payload) in selector_terms(self.dfg, lhs) {
+            for (rhs_condition, rhs_payload) in selector_terms(self.dfg, rhs) {
+                let complementary = is_not_of(self.dfg, rhs_condition, lhs_condition)
+                    || is_not_of(self.dfg, lhs_condition, rhs_condition);
+                if complementary && is_bit(lhs_condition) && is_bit(rhs_condition) {
+                    let payload_max = |payload: Option<ValueId>| match payload {
+                        Some(payload) => exact(payload).map(|range| range.max),
+                        None => Some(1),
+                    };
+                    let max = payload_max(lhs_payload)?.max(payload_max(rhs_payload)?);
+                    return Some(Range::new(0, max));
+                }
+            }
+        }
+        None
+    }
+
+    /// The range of `value` for consumers that assume it fits its type: `None` when
+    /// [`may_exceed_type`] holds and no bound within the type is known.
+    fn operand_range(&self, value: ValueId, facts: &Facts) -> Option<ValueRange> {
+        if !may_exceed_type(self.dfg, value) {
             return facts.range(value);
         }
-        let Value::Instruction { instruction, .. } = self.dfg[value] else {
-            return facts.range(value);
-        };
-        let Instruction::Binary(binary) = &self.dfg[instruction] else {
-            return facts.range(value);
-        };
-        let value_bit_size = self.dfg.type_of_value(binary.lhs).bit_size();
-        let Some(ranges) = self.binary_ranges(binary, value_bit_size, facts) else {
-            return facts.range(value);
-        };
-        match binary.operator {
-            BinaryOp::Add { .. } => Some(ranges.add(true)),
-            BinaryOp::Mul { .. } => Some(ranges.mul(true)),
-            _ => facts.range(value),
+        let range = self.exact_range(value, facts)?;
+        let fits_type = self.unsigned_type_max(value).is_none_or(|type_max| range.max <= type_max);
+        fits_type.then_some(ValueRange::Unsigned(range))
+    }
+
+    /// The range of the field element `value` holds, as read by a cast, which preserves it.
+    fn cast_source_range(&self, value: ValueId, facts: &Facts) -> Option<ValueRange> {
+        if may_exceed_type(self.dfg, value) {
+            self.exact_range(value, facts).map(ValueRange::Unsigned)
+        } else {
+            facts.range(value)
+        }
+    }
+
+    fn unsigned_type_max(&self, value: ValueId) -> Option<u128> {
+        match self.dfg.type_of_value(value).as_ref() {
+            Type::Numeric(NumericType::Unsigned { bit_size }) => {
+                max_unsigned_value_for_bit_size(*bit_size)
+            }
+            _ => None,
         }
     }
 
@@ -433,13 +597,13 @@ impl<'dfg> Analysis<'dfg> {
                         return None;
                     }
                     let original_type = self.dfg.type_of_value(*original_value);
-                    self.untruncated_range(*original_value, facts)
+                    self.cast_source_range(*original_value, facts)
                         .and_then(|range| range.cast_to_field(original_type.as_ref()))
                         .map(ValueRange::Unsigned)
                 }
                 Type::Numeric(NumericType::Unsigned { bit_size }) => {
                     let original_type = self.dfg.type_of_value(*original_value);
-                    let original_range = self.untruncated_range(*original_value, facts)?;
+                    let original_range = self.cast_source_range(*original_value, facts)?;
                     original_range
                         .cast_to_unsigned(original_type.as_ref(), *bit_size)
                         .map(ValueRange::Unsigned)
@@ -465,7 +629,7 @@ impl<'dfg> Analysis<'dfg> {
                 binary.operator.forward(ranges)
             }
             Instruction::Not(original_value) => {
-                facts.range(*original_value)?.not(result_type.as_ref())
+                self.operand_range(*original_value, facts)?.not(result_type.as_ref())
             }
             _ => None,
         }
@@ -501,8 +665,8 @@ impl<'dfg> Analysis<'dfg> {
         BinaryRanges::new(
             self.dfg.type_of_value(binary.lhs).unwrap_numeric(),
             value_bit_size,
-            facts.range(binary.lhs)?,
-            facts.range(binary.rhs)?,
+            self.operand_range(binary.lhs, facts)?,
+            self.operand_range(binary.rhs, facts)?,
         )
     }
 
@@ -517,14 +681,16 @@ impl<'dfg> Analysis<'dfg> {
         match result_type {
             Type::Numeric(NumericType::Unsigned { .. } | NumericType::NativeField) => {
                 let max = max_unsigned_value_for_bit_size(value_bit_size.min(bit_size))?;
-                let original_range = facts.range(original_value)?;
+                let original_range = self
+                    .operand_range(original_value, facts)
+                    .unwrap_or(ValueRange::Unsigned(Range::new(0, max)));
                 original_range
                     .cast_to_unsigned(result_type, value_bit_size.min(bit_size))
                     .map(|range| ValueRange::Unsigned(range.truncate_to(max)))
             }
             Type::Numeric(NumericType::Signed { bit_size: result_bit_size }) => {
                 if bit_size >= *result_bit_size {
-                    return facts.range(original_value);
+                    return self.operand_range(original_value, facts);
                 }
                 let max = i128::try_from(max_unsigned_value_for_bit_size(bit_size)?).ok()?;
                 Some(ValueRange::Signed(SignedRange::new(0, max)))
