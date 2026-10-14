@@ -47,3 +47,79 @@ impl Function {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{assert_ssa_snapshot, ssa::ssa_gen::Ssa};
+
+    #[test]
+    fn keeps_range_check_on_unchecked_add_that_can_exceed_its_type() {
+        // `v2` can be 510 in ACIR.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8):
+            v2 = unchecked_add v0, v1
+            range_check v2 to 8 bits
+            return v2
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_redundant_range_checks();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8):
+            v2 = unchecked_add v0, v1
+            return v2
+        }
+        ");
+    }
+
+    #[test]
+    fn keeps_range_check_on_field_cast_of_unchecked_u1_add() {
+        // `v3` can be 2 in ACIR.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1):
+            v2 = unchecked_add v0, v1
+            v3 = cast v2 as Field
+            range_check v3 to 1 bits
+            return v3
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_redundant_range_checks();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1):
+            v2 = unchecked_add v0, v1
+            v3 = cast v2 as Field
+            return v3
+        }
+        ");
+    }
+
+    #[test]
+    fn removes_range_check_on_unchecked_add_that_fits_its_type() {
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8):
+            v2 = truncate v0 to 7 bits, max_bit_size: 8
+            v3 = truncate v1 to 7 bits, max_bit_size: 8
+            v4 = unchecked_add v2, v3
+            range_check v4 to 8 bits
+            return v4
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.remove_redundant_range_checks();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8):
+            v2 = truncate v0 to 7 bits, max_bit_size: 8
+            v3 = truncate v1 to 7 bits, max_bit_size: 8
+            v4 = unchecked_add v2, v3
+            return v4
+        }
+        ");
+    }
+}

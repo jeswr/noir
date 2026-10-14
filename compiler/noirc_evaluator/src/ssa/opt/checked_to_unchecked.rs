@@ -427,4 +427,249 @@ mod tests {
         }
         ");
     }
+
+    #[test]
+    fn does_not_uncheck_mul_by_cast_of_unchecked_u1_add_in_acir() {
+        // In ACIR `unchecked_add u1 v0, v1` is the field value 2 when both are 1, so after the
+        // cast `v4` is not a 0/1 value and the product can exceed `u8`.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = cast v3 as u8
+            v5 = mul v4, v2
+            return v5
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = cast v3 as u8
+            v5 = mul v4, v2
+            return v5
+        }
+        ");
+    }
+
+    #[test]
+    fn unchecks_add_of_cast_of_unchecked_u8_add_using_its_widened_bound_in_acir() {
+        // `v4` can be 510 in ACIR, a 9-bit value, so `v4 + v5` still fits in `u16`.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = cast v3 as u16
+            v5 = cast v2 as u16
+            v6 = add v4, v5
+            return v6
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = cast v3 as u16
+            v5 = cast v2 as u16
+            v6 = unchecked_add v4, v5
+            return v6
+        }
+        ");
+    }
+
+    #[test]
+    fn does_not_uncheck_sub_from_constant_of_cast_of_unchecked_u1_sub_in_acir() {
+        // An unchecked ACIR sub can underflow to a field-negative value of any width.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1):
+            v2 = unchecked_sub v0, v1
+            v3 = cast v2 as u32
+            v5 = sub u32 1, v3
+            return v5
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1):
+            v2 = unchecked_sub v0, v1
+            v3 = cast v2 as u32
+            v5 = unchecked_sub u32 1, v3
+            return v5
+        }
+        ");
+    }
+
+    #[test]
+    fn unchecks_mul_by_truncated_unchecked_u1_add_in_acir() {
+        // A truncation brings the unchecked result back to one bit.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = truncate v3 to 1 bits, max_bit_size: 2
+            v5 = cast v4 as u8
+            v6 = mul v5, v2
+            return v6
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = truncate v3 to 1 bits, max_bit_size: 2
+            v5 = cast v4 as u8
+            v6 = unchecked_mul v5, v2
+            return v6
+        }
+        ");
+    }
+
+    #[test]
+    fn unchecks_mul_by_cast_of_unchecked_u1_add_in_brillig() {
+        // In Brillig unchecked arithmetic wraps to the type width.
+        let src = "
+        brillig(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = cast v3 as u8
+            v5 = mul v4, v2
+            return v5
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        brillig(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = cast v3 as u8
+            v5 = mul v4, v2
+            return v5
+        }
+        ");
+    }
+
+    #[test]
+    fn unchecks_mul_by_cast_of_merged_bools_in_acir() {
+        // `v4 = v0 + not(v0) * v1` selects `v0` or `v1`, so it is still a single bit.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = not v0
+            v4 = unchecked_mul v3, v1
+            v5 = unchecked_add v0, v4
+            v6 = cast v5 as u8
+            v7 = mul v6, v2
+            return v7
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = not v0
+            v4 = unchecked_mul v3, v1
+            v5 = unchecked_add v0, v4
+            v6 = cast v5 as u8
+            v7 = mul v6, v2
+            return v7
+        }
+        ");
+    }
+
+    #[test]
+    fn does_not_treat_sum_as_selection_when_condition_is_not_a_bit_in_acir() {
+        // `v3` can be 2, so `v4 = not v3` is field-negative and `v3 * v1 + v4 * v1` is not a
+        // selection.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v0
+            v4 = not v3
+            v5 = unchecked_mul v3, v1
+            v6 = unchecked_mul v4, v1
+            v7 = unchecked_add v5, v6
+            v8 = cast v7 as u8
+            v9 = mul v8, v2
+            return v9
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v0
+            v4 = not v3
+            v5 = unchecked_mul v3, v1
+            v6 = unchecked_mul v4, v1
+            v7 = unchecked_add v5, v6
+            v8 = cast v7 as u8
+            v9 = mul v8, v2
+            return v9
+        }
+        ");
+    }
+
+    #[test]
+    fn does_not_uncheck_mul_by_cast_of_not_of_unchecked_u1_add_in_acir() {
+        // `v4 = not v3` is `1 - 2`, field-negative, when `v3` is 2.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = not v3
+            v5 = cast v4 as u8
+            v6 = mul v5, v2
+            return v6
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u1, v1: u1, v2: u8):
+            v3 = unchecked_add v0, v1
+            v4 = not v3
+            v5 = cast v4 as u8
+            v6 = unchecked_mul v5, v2
+            return v6
+        }
+        ");
+    }
+
+    #[test]
+    fn does_not_uncheck_mul_of_unchecked_u8_add_by_a_bit_in_acir() {
+        // `v3` can be 510 in ACIR, so multiplying it by a bit does not keep it within `u8`.
+        let src = "
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8, v2: u1):
+            v3 = unchecked_add v0, v1
+            v4 = cast v2 as u8
+            v5 = mul v3, v4
+            return v5
+        }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.checked_to_unchecked();
+        assert_ssa_snapshot!(ssa, @r"
+        acir(inline) fn main f0 {
+          b0(v0: u8, v1: u8, v2: u1):
+            v3 = unchecked_add v0, v1
+            v4 = cast v2 as u8
+            v5 = unchecked_mul v3, v4
+            return v5
+        }
+        ");
+    }
 }
